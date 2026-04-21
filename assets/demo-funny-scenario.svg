@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 560" font-family="ui-monospace, 'SF Mono', Menlo, Consolas, monospace" font-size="13">
+  <defs>
+    <linearGradient id="bgFunny" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#010409"/>
+    </linearGradient>
+    <style>
+      .title    { fill:#e6edf3; font-size:20px; font-weight:700; }
+      .sub      { fill:#7d8590; font-size:12px; }
+      .day      { fill:#58a6ff; font-size:13px; font-weight:700; }
+      .user     { fill:#c9d1d9; font-size:12px; }
+      .userTag  { fill:#f778ba; font-size:12px; font-weight:700; }
+      .claude   { fill:#c9d1d9; font-size:12px; }
+      .claudeTag{ fill:#3fb950; font-size:12px; font-weight:700; }
+      .meta     { fill:#58a6ff; font-size:11px; font-style:italic; }
+      .panel    { fill:#161b22; stroke:#30363d; }
+      .chip     { fill:#21262d; }
+      .bad      { fill:#f85149; font-weight:700; }
+      .good     { fill:#3fb950; font-weight:700; }
+      .emoji    { font-size:16px; }
+    </style>
+  </defs>
+
+  <rect width="900" height="560" fill="url(#bgFunny)" rx="12"/>
+  <rect x="0" y="0" width="900" height="560" fill="none" stroke="#30363d" rx="12"/>
+
+  <text x="450" y="38" text-anchor="middle" class="title">A Week Without MegaMind · A Week With MegaMind</text>
+  <text x="450" y="58" text-anchor="middle" class="sub">(based on a true story, names have not been changed)</text>
+
+  <!-- MONDAY -->
+  <g transform="translate(40, 86)">
+    <rect width="820" height="66" rx="8" class="panel"/>
+    <text x="14" y="20" class="day">MONDAY · 09:00 ☕</text>
+    <text x="14" y="40"><tspan class="userTag">you › </tspan><tspan class="user">so we had this Shopify webhook bug, the HMAC secret had whitespace, and req.body wasn't a Buffer, and…</tspan></text>
+    <text x="14" y="58"><tspan class="claudeTag">claude › </tspan><tspan class="claude">Got it. Let me take a look. (nods thoughtfully)</tspan></text>
+    <animate attributeName="opacity" from="0" to="1" dur="0.3s" fill="freeze" begin="0.2s"/>
+  </g>
+
+  <!-- TUESDAY -->
+  <g transform="translate(40, 170)" opacity="0">
+    <animate attributeName="opacity" from="0" to="1" dur="0.3s" fill="freeze" begin="1.2s"/>
+    <rect width="820" height="66" rx="8" class="panel"/>
+    <text x="14" y="20" class="day">TUESDAY · 09:00 ☕☕</text>
+    <text x="14" y="40"><tspan class="userTag">you › </tspan><tspan class="user">so we had this Shopify webhook bug, the HMAC secret had whitespace, and req.body wasn't…</tspan></text>
+    <text x="14" y="58"><tspan class="claudeTag">claude › </tspan><tspan class="claude">Got it. Let me take a look. (nods thoughtfully, again)</tspan></text>
+  </g>
+
+  <!-- WEDNESDAY -->
+  <g transform="translate(40, 254)" opacity="0">
+    <animate attributeName="opacity" from="0" to="1" dur="0.3s" fill="freeze" begin="2.2s"/>
+    <rect width="820" height="66" rx="8" class="panel"/>
+    <text x="14" y="20" class="day">WEDNESDAY · 09:00 ☕☕☕ <tspan class="bad">&#160;·&#160;&#160;🤬</tspan></text>
+    <text x="14" y="40"><tspan class="userTag">you › </tspan><tspan class="user">SO WE HAD THIS SHOPIFY WEBHOOK BUG. WHITESPACE. BUFFER. YOU KNOW THIS.</tspan></text>
+    <text x="14" y="58"><tspan class="claudeTag">claude › </tspan><tspan class="claude">Fascinating problem! Let me take a look. 🎩</tspan></text>
+  </g>
+
+  <!-- THURSDAY · install -->
+  <g transform="translate(40, 338)" opacity="0">
+    <animate attributeName="opacity" from="0" to="1" dur="0.3s" fill="freeze" begin="3.2s"/>
+    <rect width="820" height="66" rx="8" class="panel" stroke="#d29922"/>
+    <text x="14" y="20" class="day" fill="#d29922">THURSDAY · 00:47 · 🧠 epiphany</text>
+    <text x="14" y="40"><tspan class="userTag">shell $ </tspan><tspan class="user">git clone https://github.com/hustlerv369/hustlers-megamind ~/.claude/skills/megamind</tspan></text>
+    <text x="14" y="58"><tspan class="userTag">shell $ </tspan><tspan class="user">python ~/.claude/skills/megamind/scripts/install.py</tspan><tspan class="good">  ✓ 4 hooks registered</tspan></text>
+  </g>
+
+  <!-- FRIDAY · magic -->
+  <g transform="translate(40, 422)" opacity="0">
+    <animate attributeName="opacity" from="0" to="1" dur="0.3s" fill="freeze" begin="4.2s"/>
+    <rect width="820" height="90" rx="8" class="panel" stroke="#3fb950" stroke-width="2"/>
+    <text x="14" y="20" class="day" fill="#3fb950">FRIDAY · 09:00 ☕ · 🧠 MegaMind awake</text>
+    <text x="14" y="42"><tspan class="meta">[auto-loaded from memory: shopify_webhook_fix.md · tomorrow_e2e_test.md]</tspan></text>
+    <text x="14" y="60"><tspan class="userTag">you › </tspan><tspan class="user">fix the bug</tspan></text>
+    <text x="14" y="80"><tspan class="claudeTag">claude › </tspan><tspan class="claude">The HMAC whitespace one in verify-session.ts? Already patched.</tspan> <tspan class="good">Next: run E2E.</tspan></text>
+  </g>
+
+  <!-- Tagline -->
+  <g transform="translate(450, 538)" text-anchor="middle" opacity="0">
+    <animate attributeName="opacity" from="0" to="1" dur="0.5s" fill="freeze" begin="5s"/>
+    <text fill="#e6edf3" font-size="13" font-weight="bold">
+      <tspan class="emoji">🧠 </tspan>Hustlers MegaMind —
+      <tspan fill="#7d8590">so you stop re-explaining your own life to a language model.</tspan>
+    </text>
+  </g>
+</svg>

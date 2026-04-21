@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 500" font-family="ui-monospace, 'SF Mono', Menlo, Consolas, monospace" font-size="14">
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#010409"/>
+    </linearGradient>
+    <linearGradient id="barRed" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#f85149"/>
+      <stop offset="100%" stop-color="#da3633"/>
+    </linearGradient>
+    <linearGradient id="barGreen" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#3fb950"/>
+      <stop offset="100%" stop-color="#238636"/>
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="2" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect width="900" height="500" fill="url(#bgGrad)" rx="12"/>
+
+  <text x="450" y="40" text-anchor="middle" fill="#e6edf3" font-size="22" font-weight="bold">
+    Hustlers MegaMind — token savings per working day
+  </text>
+  <text x="450" y="64" text-anchor="middle" fill="#7d8590" font-size="13">
+    5 sessions × average re-explain context vs auto-loaded memory
+  </text>
+
+  <g transform="translate(60, 110)">
+    <text x="0" y="0" fill="#f85149" font-weight="bold" font-size="15">WITHOUT MegaMind</text>
+    <text x="0" y="22" fill="#7d8590" font-size="12">You retype the last session every time.</text>
+
+    <rect x="0" y="40" width="0" height="38" rx="6" fill="url(#barRed)" filter="url(#glow)">
+      <animate attributeName="width" from="0" to="720" dur="2s" fill="freeze" begin="0.3s"/>
+    </rect>
+    <text x="12" y="64" fill="#fff" font-weight="bold" opacity="0">
+      30,000 tokens wasted
+      <animate attributeName="opacity" from="0" to="1" dur="0.4s" fill="freeze" begin="2.1s"/>
+    </text>
+  </g>
+
+  <g transform="translate(60, 210)">
+    <text x="0" y="0" fill="#3fb950" font-weight="bold" font-size="15">WITH MegaMind</text>
+    <text x="0" y="22" fill="#7d8590" font-size="12">Hooks inject relevant memory silently.</text>
+
+    <rect x="0" y="40" width="0" height="38" rx="6" fill="url(#barGreen)" filter="url(#glow)">
+      <animate attributeName="width" from="0" to="168" dur="1.2s" fill="freeze" begin="2.5s"/>
+    </rect>
+    <text x="12" y="64" fill="#fff" font-weight="bold" opacity="0">
+      7,000 tokens auto-loaded
+      <animate attributeName="opacity" from="0" to="1" dur="0.4s" fill="freeze" begin="3.6s"/>
+    </text>
+  </g>
+
+  <g transform="translate(60, 320)" opacity="0">
+    <animate attributeName="opacity" from="0" to="1" dur="0.5s" fill="freeze" begin="4s"/>
+    <rect x="0" y="0" width="780" height="80" rx="8" fill="#161b22" stroke="#30363d"/>
+    <text x="20" y="28" fill="#7d8590" font-size="12">NET SAVINGS PER WEEK</text>
+    <text x="20" y="58" fill="#3fb950" font-size="28" font-weight="bold">
+      ≈ 23,000 tokens
+    </text>
+    <text x="320" y="35" fill="#e6edf3" font-size="13">Break-even after 3 user messages.</text>
+    <text x="320" y="54" fill="#e6edf3" font-size="13">Everything after is pure savings.</text>
+    <text x="320" y="70" fill="#7d8590" font-size="12">No network calls. No cloud. No Claude API overhead.</text>
+  </g>
+
+  <g transform="translate(60, 430)" opacity="0">
+    <animate attributeName="opacity" from="0" to="1" dur="0.5s" fill="freeze" begin="4.5s"/>
+    <circle cx="8" cy="10" r="4" fill="#3fb950"/>
+    <text x="24" y="15" fill="#7d8590" font-size="12">SessionStart ≤ 1500 tokens</text>
+    <circle cx="248" cy="10" r="4" fill="#3fb950"/>
+    <text x="264" y="15" fill="#7d8590" font-size="12">UserPromptSubmit ≤ 400 tokens · silent on no-match</text>
+    <circle cx="648" cy="10" r="4" fill="#3fb950"/>
+    <text x="664" y="15" fill="#7d8590" font-size="12">Python stdlib only</text>
+  </g>
+
+  <rect x="0" y="0" width="900" height="500" fill="none" stroke="#30363d" rx="12"/>
+</svg>
