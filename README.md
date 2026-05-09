@@ -2,6 +2,11 @@
 
 > **Persistent memory layer for Claude Code.** Token-efficient. Local. Zero deps. Yours.
 
+[![tests](https://github.com/hustlerv369/hustlers-megamind/actions/workflows/test.yml/badge.svg)](https://github.com/hustlerv369/hustlers-megamind/actions/workflows/test.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![python: 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+[![deps: stdlib only](https://img.shields.io/badge/deps-stdlib%20only-brightgreen.svg)](#design-principles-the-token-safety-contract)
+
 Between sessions, MegaMind remembers so you don't have to re-explain.
 What went into your project yesterday ships with tomorrow's first prompt —
 without you lifting a finger.
@@ -90,6 +95,28 @@ The installer:
 
 Restart Claude Code (or open a new session) for hooks to take effect.
 
+### Verify install
+
+After restarting Claude Code, confirm everything is wired up:
+
+```bash
+python ~/.claude/skills/megamind/scripts/cli.py status
+```
+
+You should see your project slug + memory dir path. If the dir doesn't
+exist yet (you've never run a session in this project after install),
+bootstrap one with:
+
+```bash
+python ~/.claude/skills/megamind/scripts/cli.py init
+# or seed with a starter template:
+python ~/.claude/skills/megamind/scripts/cli.py init --template nextjs-saas
+```
+
+You can also confirm the hooks were written by inspecting
+`~/.claude/settings.json` — there should be entries pointing at
+`megamind/scripts/hook_*.py` under each of the four lifecycle keys.
+
 ### Uninstall
 
 ```bash
@@ -114,7 +141,8 @@ Removes only MegaMind entries, leaves everything else untouched.
     ├── hook_user_prompt.py         # UserPromptSubmit hook runner
     ├── hook_pre_compact.py         # PreCompact hook runner
     ├── hook_stop.py                # Stop hook runner
-    ├── cli.py                      # on-demand: status / recall / list
+    ├── cli.py                      # on-demand: status / recall / list / sync / …
+    ├── sync.py                     # optional git-backed cross-device vault
     └── install.py                  # idempotent registrator / uninstaller
 ```
 
@@ -135,6 +163,10 @@ Removes only MegaMind entries, leaves everything else untouched.
 Project slug mirrors Claude Code's internal slugification:
 `D:\CLAUDE\my-project` → `D--CLAUDE-my-project`. Worktrees auto-fallback
 to their parent project's memory.
+
+A reference `MEMORY.md` plus example `facts/` and `sessions/` files live
+in [`examples/`](examples/) — copy any of them into your project's memory
+dir as a starting point.
 
 ---
 
@@ -201,6 +233,10 @@ python cli.py audit                       # scan memory files for leaked secrets
 python cli.py init [--template <name>]    # bootstrap memory (optionally from template)
 python cli.py templates                   # list available starter templates
 ```
+
+> Tip: from anywhere on disk, prefix the command with the absolute path:
+> `python ~/.claude/skills/megamind/scripts/cli.py status`. The shorter
+> `python cli.py …` form assumes your shell is `cd`'d into `scripts/`.
 
 ### Examples
 
@@ -337,6 +373,8 @@ verify_before_citing: ['/pricing', 'billing provider dashboard']
 - E2E signup test with QA
 ```
 
+Reference copies of all three live in [`examples/`](examples/).
+
 ---
 
 ## Other memory projects in the Claude Code ecosystem
@@ -392,6 +430,9 @@ modifiable, zero-dependency, free forever.
 - ✅ `cli.py stats` — hook fire counts + token savings estimate
 - ✅ `cli.py audit` — secrets scanner (15 patterns: Stripe, OpenAI, Anthropic, AWS, GitHub, JWT, private keys, etc.)
 - ✅ `cli.py init --template <name>` — five starter templates
+
+Full version history → [CHANGELOG.md](CHANGELOG.md).
+Public direction → [ROADMAP.md](ROADMAP.md).
 
 ### v0.2 — next
 - **SQLite FTS5 backend** — replace linear grep for projects with 100+ memory files
@@ -453,6 +494,27 @@ python ~/.claude/skills/megamind/scripts/cli.py sync pull
 
 All your memory, instantly ported.
 
+### All `sync` commands (full reference)
+
+| Command | What it does |
+|---------|--------------|
+| `sync auto-setup [--repo-name <name>] [--public]` | One-shot via `gh` CLI: create private (default) repo, link, first push, enable autosync. `--public` makes it public; `--repo-name` overrides the default `memory-vault`. |
+| `sync init <remote-url> [--branch <name>] [--no-autosync]` | Manual: link an existing repo as the vault remote. Default branch is `main`. `--no-autosync` skips enabling autosync after init. |
+| `sync push [-m "<msg>"]` | Stage all memory changes, commit (default message is timestamped) and push to `origin`. No-op when there are no changes. |
+| `sync pull` | `git pull --rebase --autostash` from `origin`. |
+| `sync status` | Pending vault changes (`git status --short`). |
+| `sync auto-on` | Enable background autosync (pull on SessionStart, push on Stop). |
+| `sync auto-off` | Disable background autosync. |
+| `sync auto-status` | Print autosync flag + vault initialization state. |
+
+Rate limits (configured in `scripts/sync.py`):
+
+- **SessionStart auto-pull:** at most once per 5 minutes
+- **Stop auto-push:** at most once per 10 minutes
+
+Both are silent on any failure (offline, auth prompt, conflict) so they
+never break a Claude Code session.
+
 ### Where auto-sync actually works (honest table)
 
 | Environment | Auto-pull on start | Auto-push on finish |
@@ -474,6 +536,46 @@ one-tap from anywhere.
 - `.megamind-stats.json` is ignored (per-machine counter).
 - Run `python cli.py audit` before your first push to scan for accidental secrets. Run it periodically after.
 - Use a **private** repo. Never put your memory vault in a public repo.
+
+---
+
+## Testing & development
+
+The repo ships **31 smoke tests** covering `lib.py`, `cli.py`, and
+`sync.py`. The only test-time dependency is `pytest` itself — runtime is
+still stdlib-only.
+
+```bash
+git clone https://github.com/hustlerv369/hustlers-megamind
+cd hustlers-megamind
+python -m pip install pytest
+python -m pytest tests/ -v
+```
+
+CI runs the suite on a 3 × 3 matrix (Ubuntu / macOS / Windows × Python
+3.9 / 3.11 / 3.12) — see
+[`.github/workflows/test.yml`](.github/workflows/test.yml).
+
+For the contribution flow, guiding principles (token-saving > token-spending;
+zero deps; silent no-op default; under 1000 LOC; cross-platform), and
+local style notes, see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+---
+
+## Project documentation
+
+| File | What it covers |
+|------|----------------|
+| [README.md](README.md) | This file — full overview, install, usage, design |
+| [SKILL.md](SKILL.md) | Skill metadata for the Claude Code Skill tool |
+| [CHANGELOG.md](CHANGELOG.md) | Version history (Keep a Changelog format) |
+| [ROADMAP.md](ROADMAP.md) | Public direction: shipped / next / non-goals |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | How to propose changes |
+| [SECURITY.md](SECURITY.md) | Vulnerability disclosure flow |
+| [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) | Community standards |
+| [`examples/`](examples/) | Reference `MEMORY.md`, session note, fact file |
+| [`templates/`](templates/) | Five starter project templates |
+| [`assets/mobile-preamble.md`](assets/mobile-preamble.md) | Paste-ready preamble for Claude mobile/web |
 
 ---
 
