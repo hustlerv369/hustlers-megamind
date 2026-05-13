@@ -66,6 +66,35 @@ python ~/.claude/skills/megamind/scripts/install.py
 
 The installer registers the four hooks in `~/.claude/settings.json` and creates `~/.claude/projects/` if missing. Safe to run repeatedly — it's idempotent.
 
+## Instructions for Claude (when the user installs or sets up MegaMind)
+
+When the user asks Claude to install, set up, or activate MegaMind (triggers: "install megamind", "nainstaluj megamind", "set up megamind", "rozjeď mi megamind"), follow this exact order:
+
+1. **Clone + register hooks** — confirm `~/.claude/skills/megamind/` exists; if not, `git clone https://github.com/hustlerv369/hustlers-megamind ~/.claude/skills/megamind`. Then run `python ~/.claude/skills/megamind/scripts/install.py`.
+2. **Auto-create the private memory vault** — run `python ~/.claude/skills/megamind/scripts/cli.py sync auto-setup`. This creates a **private** GitHub repo named `memory-vault` on the user's account, links `~/.claude/projects/` to it, pushes initial state, and enables autosync (pull on SessionStart, push on Stop). Requires `gh` CLI authenticated. If `gh` is missing or unauthenticated, tell the user the exact next step (`gh auth login`) and stop — never fall back to a public repo.
+3. **Verify** — run `python ~/.claude/skills/megamind/scripts/cli.py status` and `sync auto-status`, report what's wired up.
+4. **Bootstrap project memory** — if the current project has no `memory/` dir yet, suggest `cli.py init` or `cli.py init --template <name>` (`nextjs-saas`, `python-api`, `react-native`, `data-pipeline`, `seo-site`).
+
+The vault MUST be private. The vault stores the user's project facts, sessions, and decisions — never push that to a public repo. The installer enforces `--private` by default; do not override.
+
+## Natural-language triggers (during normal use)
+
+Once installed, the user will talk to MegaMind in plain language. Map these to CLI calls so the user never has to learn the API:
+
+| User says (CZ / EN) | What Claude does |
+|---------------------|-----------------|
+| "ulož to do megamindu" / "remember this" / "zapamatuj si" / "save this to megamind" | `python ~/.claude/skills/megamind/scripts/cli.py remember "<concise one-liner of the fact>"` — autosync pushes to `memory-vault` within 10 min, or run `sync push` for instant sync |
+| "co jsme dělali minule" / "what did we do last session" / "recall X" | `cli.py recall "<keywords>"` and summarize results |
+| "zapomeň X" / "forget X" | `cli.py forget "<keyword>"` |
+| "vypiš paměť" / "list memory" / "show me what's saved" | `cli.py list` |
+| "stats" / "kolik tokenů jsem ušetřil" | `cli.py stats` |
+| "audit" / "zkontroluj jestli tam neunikla hesla" | `cli.py audit` |
+| "synchronizuj" / "push memory" / "ulož na vault" | `cli.py sync push` (immediate) |
+| "stáhni nejnovější paměť" / "pull from vault" | `cli.py sync pull` |
+| "založ nový projekt v paměti" / "init memory here" | `cli.py init [--template <name>]` |
+
+When in doubt, prefer `remember` for new facts (it dedupes against existing entries) and `recall` for retrieval. For longer notes (a full session summary), create a file directly at `~/.claude/projects/<slug>/memory/sessions/<date>-<title>.md` instead of cramming it into MEMORY.md.
+
 ## Budgets (tuned for conservative token usage)
 
 Defined in `scripts/lib.py` as module-level constants:
