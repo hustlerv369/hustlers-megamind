@@ -68,6 +68,69 @@ Break-even: 3 user messages. Everything after is pure savings.
 
 ---
 
+## Quick start — three-minute setup
+
+Tell Claude Code:
+
+> *"Install MegaMind and set up my private memory vault."*
+
+Claude will run, in order:
+
+```bash
+# 1. Get the skill + register hooks
+git clone https://github.com/hustlerv369/hustlers-megamind ~/.claude/skills/megamind
+python ~/.claude/skills/megamind/scripts/install.py
+
+# 2. Create your PRIVATE memory-vault repo on GitHub + enable autosync
+python ~/.claude/skills/megamind/scripts/cli.py sync auto-setup
+
+# 3. Confirm it's live
+python ~/.claude/skills/megamind/scripts/cli.py status
+python ~/.claude/skills/megamind/scripts/cli.py sync auto-status
+```
+
+The second step needs the [`gh` CLI](https://cli.github.com/) logged in
+(`gh auth login`). It creates `<your-account>/memory-vault` as a **private**
+repo. Your project facts, decisions, and session notes go there — **never**
+to this public skill repo. After this, autosync pulls on every new session
+and pushes after each Claude response (rate-limited).
+
+---
+
+## Daily use — talk to Claude in plain language
+
+You don't need to learn the CLI. Once MegaMind is installed, just talk
+to Claude. Claude reads `SKILL.md` and maps natural language to the
+right command. Examples that work out of the box:
+
+| Say this to Claude | Claude does this |
+|--------------------|------------------|
+| *"Save this to MegaMind: we decided to use Postgres, not MySQL."* | Appends a one-liner to `MEMORY.md`, autosync uploads to your private `memory-vault` repo |
+| *"Remember that the staging URL is staging.example.com."* | Same — fact stored + auto-synced |
+| *"What did we do last session?"* | Recalls the newest session note from memory |
+| *"Search memory for Stripe webhook."* | Runs `cli.py recall "Stripe webhook"` and summarizes matches |
+| *"Forget the old pricing fact."* | Removes the matching MEMORY.md line |
+| *"How many tokens did MegaMind save me?"* | Prints `cli.py stats` |
+| *"Audit my memory for leaked secrets."* | Runs `cli.py audit` (15 secret patterns) |
+| *"Init memory for this project with the Next.js template."* | `cli.py init --template nextjs-saas` |
+| *"Push memory now."* / *"Pull latest memory."* | `cli.py sync push` / `cli.py sync pull` |
+
+Localized triggers (Czech / English) are listed in `SKILL.md` — Claude
+recognizes both.
+
+### What MegaMind already does without you asking
+
+- **Every new session** — auto-loads `MEMORY.md` + the newest session note (≤1500 tokens)
+- **Every prompt** — silently greps memory for relevant context (≤400 tokens, silent if no hit)
+- **Before compaction** — saves the transcript tail to `sessions/compact-*.md` so the next session can pick up
+- **After Claude responds** — auto-commits + pushes your memory to the vault (rate-limited to once per 10 min)
+
+You only need explicit "save this to MegaMind" calls when you want a
+specific fact captured **right now** that Claude wouldn't otherwise
+identify as long-term-relevant.
+
+---
+
 ## Install
 
 ### From GitHub (recommended for first-time users)
