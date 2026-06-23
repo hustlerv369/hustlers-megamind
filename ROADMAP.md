@@ -1,6 +1,6 @@
 # Roadmap
 
-Public direction for Hustlers MegaMind. Priorities can shift based on
+Public direction for Megamind Ultra. Priorities can shift based on
 issues and PRs.
 
 ## v0.1 — current (April 2026)
@@ -9,19 +9,9 @@ issues and PRs.
 - [x] Grep-first keyword search with BM25-like scoring
 - [x] Hard token budgets per hook
 - [x] Idempotent installer / uninstaller
-- [x] CLI: `status`, `recall`, `list`, `remember`, `forget`, `stats`,
-      `audit`, `init --template`, `templates`
-- [x] `bump_stat()` token-savings tracker plumbed through all hooks
-- [x] Secrets scanner — 15 credential patterns
-- [x] Five bundled templates: `nextjs-saas`, `python-api`, `react-native`,
-      `data-pipeline`, `seo-site`
-- [x] `cli.py sync auto-setup / push / pull / auto-on` — git-backed
-      cross-device memory vault with autosync on SessionStart (pull)
-      and Stop (push)
-- [x] Mobile preamble + browser bookmarklet for web/app Claude
-- [x] 31 smoke tests
+- [x] CLI for status / recall / list
 - [x] Cross-platform (Windows Git Bash, macOS, Linux)
-- [x] Full README, LICENSE, CONTRIBUTING, SECURITY
+- [x] Full README, LICENSE, CONTRIBUTING
 
 ## v0.2 — next
 
@@ -42,7 +32,8 @@ issues and PRs.
 - [ ] **Consolidation skill** — reflective pass that merges duplicate
   facts, prunes session notes older than 30 days, rebuilds MEMORY.md
   index. Runs manually via CLI, optionally weekly cron.
-- [ ] **More templates** — Rails, Go API, SvelteKit, Nuxt, Laravel.
+- [ ] **Slash commands** — register `/remember`, `/forget`, `/recall` as
+  Claude Code commands so users don't need to remember CLI syntax.
 
 ## v0.4 — optional semantic
 

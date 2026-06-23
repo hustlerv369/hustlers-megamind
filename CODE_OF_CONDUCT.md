@@ -2,7 +2,7 @@
 
 ## Our Pledge
 
-We pledge to make participation in Hustlers MegaMind a harassment-free
+We pledge to make participation in Megamind Ultra a harassment-free
 experience for everyone, regardless of age, body size, visible or
 invisible disability, ethnicity, sex characteristics, gender identity and
 expression, level of experience, education, socio-economic status,

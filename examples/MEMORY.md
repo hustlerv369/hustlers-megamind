@@ -1,7 +1,7 @@
 # Project memory index
 
 Place this file at `~/.claude/projects/<your-project-slug>/memory/MEMORY.md`.
-Hustlers MegaMind auto-loads it at every session start (budget ≤ 1500 tokens).
+Megamind Ultra auto-loads it at every session start (budget ≤ 1500 tokens).
 
 Convention: one line per entry with an emoji tag for priority, a linked
 filename, and a one-sentence description. Claude learns to treat the

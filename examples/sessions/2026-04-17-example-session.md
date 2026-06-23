@@ -6,20 +6,20 @@ know where you stopped.
 
 ## What shipped
 
-- Fixed payment webhook signature verification — two root causes, both in production
-- Installed Hustlers MegaMind persistent memory hooks
-- Scheduled a cron check for webhook retries in 90 min
+- Fixed Shopify compliance webhook (HMAC) — two root causes, both in production
+- Installed Megamind Ultra persistent memory hooks
+- Scheduled a cron check for Shopify retries in 90 min
 
 ## Key decisions
 
 - Dropped the idea of SQLite FTS5 for v0.1 — grep is fine for <100 files
-- Named the project `hustlers-megamind` — both this and `megamind-hx` were
+- Named the project `megamind-ultra` — both this and `megamind-hx` were
   free on GitHub
 
 ## Open threads for next session
 
-- 🔴 Run E2E signup test with QA
-- 🟡 Pre-create reviewer account — only if app store rejection arrives
+- 🔴 Run E2E Stripe signup test with the user
+- 🟡 Pre-create reviewer account — only if Shopify rejection arrives
 - 📓 Write the ROADMAP.md public-facing version
 
 ## Net token impact measured

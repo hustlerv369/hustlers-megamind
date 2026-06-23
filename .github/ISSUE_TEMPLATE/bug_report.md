@@ -30,7 +30,7 @@ assignees: ''
 - Shell: <!-- Git Bash / PowerShell / bash / zsh -->
 - Python: <!-- python --version -->
 - Claude Code: <!-- version string -->
-- Hustlers MegaMind version: <!-- commit hash or tag -->
+- Megamind Ultra version: <!-- commit hash or tag -->
 
 ## Token measurements (if applicable)
 

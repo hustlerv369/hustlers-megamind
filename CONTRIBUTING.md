@@ -1,4 +1,4 @@
-# Contributing to Hustlers MegaMind
+# Contributing to Megamind Ultra
 
 Thanks for thinking about contributing. This project is intentionally small
 and intentionally boring — the goal is **memory that just works**, not a

@@ -1,115 +1,96 @@
 ---
 name: megamind
-description: Persistent cross-session memory for Claude Code. Installed via hooks in ~/.claude/settings.json — SessionStart auto-loads MEMORY.md index + latest session note, UserPromptSubmit injects relevant memory snippets based on keyword match, PreCompact saves a transcript tail before compaction, Stop stamps a last-active marker. Zero external dependencies (Python stdlib + grep). Hard token budgets per hook (session ≤1500, prompt ≤400). Storage: ~/.claude/projects/<slug>/memory/*.md.
+description: The single ULTRA memory + token-saving skill for Claude Code. Persistent cross-session memory via 4 hooks (SessionStart loads the MEMORY.md index + newest CLEAN session note; UserPromptSubmit injects keyword-matched snippets; PreCompact writes a clean structured resume — base64/JSONL/tool-noise stripped at write time, never the raw transcript; Stop stamps last-active + debounced memory-vault auto-sync). Also the home of LEAN MODE — token-discipline directives + a reversible `lean apply` that flips opus[1m]→opus and xhigh→high and flags always-on MCP overhead. Zero external deps (Python stdlib + git CLI). Read this when the user asks about memory, context, recall, OR token/context usage, "save tokens", "reduce context", "session cost", "exhausting my limit". CZ: "paměť", "kontext", "šetřit tokeny", "snížit spotřebu", "megamind".
 ---
 
-# MegaMind — persistent memory for Claude Code
+# MegaMind Ultra — memory + token discipline, one skill
 
-## What it does
+Claude Code has no memory between sessions and re-sends a growing context every
+turn. MegaMind is the single skill that fixes both: it remembers across sessions
+**and** keeps junk out of the context window. Three pillars.
 
-Claude Code by default has **no memory between sessions**. Project facts you write in `~/.claude/projects/<slug>/memory/` are just files on disk — Claude never reads them unless explicitly told. MegaMind bridges that gap with four hooks registered in `~/.claude/settings.json`.
+## Pillar 1 — MEMORY (4 hooks, registered in `~/.claude/settings.json`)
 
-| Hook | When it fires | What it injects into context | Token cost |
-|------|---------------|------------------------------|-----------|
-| **SessionStart** | New session opens / resume / clear | `MEMORY.md` index + the single newest `sessions/*.md` note | ≤1500 tokens once per session |
-| **UserPromptSubmit** | Every user message | Top-3 memory files matching keywords in the message | ≤400 tokens per prompt (silent if no hit) |
-| **PreCompact** | Auto-compaction kicks in | **Nothing** — writes transcript tail to `sessions/compact-*.md` for future sessions to pick up | 0 tokens |
-| **Stop** | Claude finishes responding | **Nothing** — updates `.last-active` marker | 0 tokens |
+| Hook | Fires | Injects | Cost |
+|------|-------|---------|------|
+| **SessionStart** | session open / resume / clear | `MEMORY.md` index + newest **clean** `sessions/*.md` note (transcript-noise dumps are skipped) + the Lean line | ≤1500 tok once |
+| **UserPromptSubmit** | every message | top-3 keyword-matched memory files, **noise-filtered + deduped** | ≤400 tok (silent if no hit) |
+| **PreCompact** | before auto-compaction | **nothing to context.** Writes a CLEAN structured resume (`sessions/<stamp>-resume-*.md`) — recent intent, decisions, files touched, commands, open questions — with base64 / tool-JSON stripped at write time | 0 tok |
+| **Stop** | response ends | **nothing to context.** Stamps `.last-active` + (if `MEGAMIND_AUTOSYNC=1`) a debounced, secret-scanned vault push | 0 tok |
 
-## Design principles
+Storage: `~/.claude/projects/<slug>/memory/{MEMORY.md, facts/, sessions/, .last-active}`.
+Project isolation: `cwd → slug` (now maps spaces too, so spaced paths like
+`D:\CLAUDE\My App` resolve to their own memory, not the parent's). Worktrees fall
+back to the parent repo's memory.
 
-1. **Token-saving, not token-spending.** Every hook has a hard char budget enforced by `format_budget`. Silent no-op when no relevant match found — never pads the context with filler.
-2. **Zero deps.** Python 3 stdlib only (`sqlite3`, `pathlib`, `re`, `json`, `os`, `sys`). No pip install, no venv, runs on Windows / macOS / Linux.
-3. **Grep-first.** Search is keyword-based via `re.findall` over `*.md` files. Fast for <1000 files, always fresh, no vector index to rebuild. SQLite FTS can be added later if corpus grows.
-4. **Project isolation.** Each project's memory lives under `~/.claude/projects/<slug>/memory/`. The hook resolves `cwd` → slug and loads only that project's memory. Worktrees auto-fall-back to their parent project's memory.
-5. **Live wins.** Preamble tells Claude: "If anything here contradicts what the user is saying now, the live conversation wins, but mention the discrepancy." Prevents stale memory from overriding fresh user input.
+**Why this version saves tokens:** the old PreCompact dumped the raw 20KB transcript
+tail — base64 image blobs + tool_result JSONL — which then got injected verbatim at
+SessionStart (newest-by-mtime) and keyword-matched into the UserPromptSubmit budget.
+A single image blob is ~25k tokens of pure noise. Now: noise can never enter context
+(write-time stripping + read-time `is_noise_file`/`is_noise_line` filters), and recall
+spends its budget only on real prose.
 
-## Directory layout per project
+## Pillar 2 — CONTEXT DISCIPLINE (where your tokens actually go)
+
+Memory is ~1900 tok/session — not the sink. The real drivers, in order:
+
+1. **`opus[1m]` (1M context)** — every turn re-sends the whole growing session as input
+   tokens; on a token-metered Max plan this burns the cap fastest. Use standard `opus`
+   (200K) by default; reserve 1M for genuinely huge-context tasks.
+2. **`effortLevel: xhigh`** — max reasoning every turn. `high` for routine work.
+3. **Always-on MCP servers** — each injects tool schemas into EVERY request. Move
+   rarely-used ones (Apify schemas are large) to a per-project `.mcp.json`.
+4. **Session bloat** — `/clear` on an unrelated task switch, `/compact` to continue;
+   route big reads (>~400 lines / >3 files) to a subagent and keep only the conclusion.
+5. **Headroom proxy** (compresses tool output ~34%) and **claude-code-router** (route
+   routine/background work to a free/cheap model) — keep both in play.
+
+## Pillar 3 — LEAN MODE + the in-session engine
+
+- **Lean directive** — SessionStart injects one ~50-token line reminding the model of
+  the discipline above. Default ON; opt out with `~/.claude/megamind-lean.off` (or
+  `/megamind lean off`). It sits in the trimmable tail, so it can never push out memory.
+- **`/megamind lean apply`** — backs up `settings.json` → `settings.json.megamind-bak`,
+  flips `opus[1m]→opus` and `xhigh→high`, lists the always-on MCP servers to prune.
+  Applies to NEW sessions (run `/clear` or restart). Revert with `lean restore`.
+- **context-mode engine (opt-in, OFF by default).** context-mode sandboxes tool output
+  (raw data never enters context) and retrieves via FTS5 — a great idea. But a GLOBAL
+  install adds ~2000–3500 schema tokens to EVERY request (11 tools) and double-hooks the
+  same 5 events MegaMind owns. So: **absorb the discipline** (route big reads/dumps
+  through a subagent or a script that returns a summary — "code-first over Read-47-files")
+  and only enable the actual engine **per-project** (`.mcp.json`, hooks disabled, tool
+  surface trimmed) for genuinely tool-heavy projects. Never global.
+
+## CLI / slash command
 
 ```
-~/.claude/projects/<slug>/memory/
-├── MEMORY.md              # index — list of files with one-line descriptions
-├── facts/                 # long-lived facts about the project
-│   ├── pricing.md
-│   ├── tech-stack.md
-│   └── …
-├── sessions/              # session diaries + pre-compact snapshots
-│   ├── 2026-04-17-night-session.md
-│   └── auto-2026-04-18-0312-compact-auto.md
-└── .last-active           # timestamp file updated by Stop hook
+/megamind status | recall <query> | list
+/megamind lean status | on | off | apply | restore
+/megamind vault sync | mirror | prune        # MEGAMIND_AUTOSYNC=1 to enable push
 ```
+Direct: `python ~/.claude/skills/megamind/scripts/cli.py <args>`
 
-## Claude-facing invocation
+## Memory-vault auto-sync (opt-in)
 
-The skill also exposes an on-demand CLI via:
-
-```
-python ~/.claude/skills/megamind/scripts/cli.py status
-python ~/.claude/skills/megamind/scripts/cli.py recall "<query>"
-python ~/.claude/skills/megamind/scripts/cli.py list
-```
-
-Use these when:
-- User asks "what did we do last session" → `cli.py recall "<their keywords>"`
-- You need to see how big the memory has grown → `cli.py status`
-- Before writing a new memory file, check for duplicates → `cli.py list`
-
-## When this skill itself should be invoked
-
-Claude should read this SKILL.md only when the user asks about the memory system itself ("how does MegaMind work", "show me memory status", "does Claude remember things"). Normal memory operations happen **invisibly via hooks** — no skill invocation needed.
-
-## Installation
-
-```bash
-python ~/.claude/skills/megamind/scripts/install.py
-```
-
-The installer registers the four hooks in `~/.claude/settings.json` and creates `~/.claude/projects/` if missing. Safe to run repeatedly — it's idempotent.
-
-## Instructions for Claude (when the user installs or sets up MegaMind)
-
-When the user asks Claude to install, set up, or activate MegaMind (triggers: "install megamind", "nainstaluj megamind", "set up megamind", "rozjeď mi megamind"), follow this exact order:
-
-1. **Clone + register hooks** — confirm `~/.claude/skills/megamind/` exists; if not, `git clone https://github.com/hustlerv369/hustlers-megamind ~/.claude/skills/megamind`. Then run `python ~/.claude/skills/megamind/scripts/install.py`.
-2. **Auto-create the private memory vault** — run `python ~/.claude/skills/megamind/scripts/cli.py sync auto-setup`. This creates a **private** GitHub repo named `memory-vault` on the user's account, links `~/.claude/projects/` to it, pushes initial state, and enables autosync (pull on SessionStart, push on Stop). Requires `gh` CLI authenticated. If `gh` is missing or unauthenticated, tell the user the exact next step (`gh auth login`) and stop — never fall back to a public repo.
-3. **Verify** — run `python ~/.claude/skills/megamind/scripts/cli.py status` and `sync auto-status`, report what's wired up.
-4. **Bootstrap project memory** — if the current project has no `memory/` dir yet, suggest `cli.py init` or `cli.py init --template <name>` (`nextjs-saas`, `python-api`, `react-native`, `data-pipeline`, `seo-site`).
-
-The vault MUST be private. The vault stores the user's project facts, sessions, and decisions — never push that to a public repo. The installer enforces `--private` by default; do not override.
-
-## Natural-language triggers (during normal use)
-
-Once installed, the user will talk to MegaMind in plain language. Map these to CLI calls so the user never has to learn the API:
-
-| User says (CZ / EN) | What Claude does |
-|---------------------|-----------------|
-| "ulož to do megamindu" / "remember this" / "zapamatuj si" / "save this to megamind" | `python ~/.claude/skills/megamind/scripts/cli.py remember "<concise one-liner of the fact>"` — autosync pushes to `memory-vault` within 10 min, or run `sync push` for instant sync |
-| "co jsme dělali minule" / "what did we do last session" / "recall X" | `cli.py recall "<keywords>"` and summarize results |
-| "zapomeň X" / "forget X" | `cli.py forget "<keyword>"` |
-| "vypiš paměť" / "list memory" / "show me what's saved" | `cli.py list` |
-| "stats" / "kolik tokenů jsem ušetřil" | `cli.py stats` |
-| "audit" / "zkontroluj jestli tam neunikla hesla" | `cli.py audit` |
-| "synchronizuj" / "push memory" / "ulož na vault" | `cli.py sync push` (immediate) |
-| "stáhni nejnovější paměť" / "pull from vault" | `cli.py sync pull` |
-| "založ nový projekt v paměti" / "init memory here" | `cli.py init [--template <name>]` |
-
-When in doubt, prefer `remember` for new facts (it dedupes against existing entries) and `recall` for retrieval. For longer notes (a full session summary), create a file directly at `~/.claude/projects/<slug>/memory/sessions/<date>-<title>.md` instead of cramming it into MEMORY.md.
-
-## Budgets (tuned for conservative token usage)
-
-Defined in `scripts/lib.py` as module-level constants:
-
-- `BUDGET_SESSION_START = 6000` chars (~1500 tokens)
-- `BUDGET_USER_PROMPT = 1600` chars (~400 tokens)
-- `BUDGET_SNIPPET = 600` chars per file (~150 tokens)
-- `MIN_KEYWORDS = 2` — fewer keywords in a prompt skips injection entirely
-- `MIN_KEYWORD_LEN = 4` — 3-char words filtered out as noise
-
-Override any of them by editing `lib.py` or exporting env vars in the hook script.
+`Stop` can mirror project memory to the `memory-vault` git repo, debounced ≥15 min, with
+every git call timeboxed. **Default OFF** (`MEGAMIND_AUTOSYNC=0`): the sync runs git
+directly (bypassing Claude's pre-commit secret hook) and your memory-vault repo may be public, so a
+stdlib secret scan runs over the staged diff and ABORTS the commit on any key-shaped
+token. Enable only after making the repo private or accepting that gate.
 
 ## Net token math
 
-Per session without MegaMind: user re-explains context → ~3000–8000 tokens wasted.
-Per session with MegaMind: ~1500 auto-loaded + ~400 per relevant-keyword prompt.
+Per session without MegaMind: re-explaining context wastes ~3000–8000 tokens.
+With MegaMind Ultra: ~1500 auto-loaded + ~400 per relevant prompt — and the recurring
+garbage-injection (up to 400 tok/prompt + a hijacked ~500-tok SessionStart slot, spiking
+to ~25k when an image blob was eligible) is eliminated entirely. `lean apply` then removes
+the structural sinks (1M re-send, xhigh, MCP schemas) that dwarf everything else.
 
-Break-even after ~3 user messages. After that, every message is pure savings.
+## Install
+
+```
+python ~/.claude/skills/megamind/scripts/install.py     # idempotent; warns on global context-mode
+```
+
+When to read this SKILL.md: only when the user asks about the memory/token system itself.
+Normal operation is invisible via hooks.

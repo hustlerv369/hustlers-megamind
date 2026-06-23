@@ -9,10 +9,15 @@ Design goals:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -27,13 +32,35 @@ for _stream in (sys.stdout, sys.stderr):
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_HOME") or (Path.home() / ".claude"))
 PROJECTS_ROOT = CLAUDE_HOME / "projects"
 
-# Budgets (characters, ~4 chars per token)
-BUDGET_SESSION_START = 6000       # ~1500 tokens
+# Budgets (characters, ~4 chars per token). Tightened for the "lean everywhere"
+# default: the index is line-clipped + the PreCompact resume is already small, so
+# the whole SessionStart payload stays well under this cap without losing the map.
+BUDGET_SESSION_START = 4500       # ~1125 tokens (was 6000)
 BUDGET_USER_PROMPT = 1600         # ~400 tokens
 BUDGET_SNIPPET = 600              # ~150 tokens per file
 BUDGET_INDEX_LINES = 60           # max lines of MEMORY.md to include
 MIN_KEYWORDS = 2                  # min keywords to trigger inject
 MIN_KEYWORD_LEN = 4
+
+# ── Ultra: token-saving constants ──
+BUDGET_PRECOMPACT = 2400          # ~600 tokens — cap for a clean resume snapshot
+TOOL_RESULT_MAX_CHARS = 240       # per tool_result, first line clipped
+RESUME_TAIL_MESSAGES = 120        # only keep last N content blocks (recency, bounded)
+TF_CAP = 5                        # cap a single keyword's term-frequency contribution
+NOISE_LINE_RATIO = 0.30           # frac of noisy lines that marks a file as garbage
+NOISE_MIN_NOISY_LINES = 6         # absolute floor so a tiny note isn't nuked
+
+# Noise signatures. RE_JSONL = Claude Code transcript rows; RE_SELFINJECT =
+# megamind's own injected blocks (never re-ingest); RE_BASE64RUN = image/blob runs.
+RE_JSONL = re.compile(
+    r'"(parentUuid|sessionId|toolUseResult|requestId|isSidechain|toolUseID|promptId|leafUuid)"\s*:'
+)
+RE_SELFINJECT = re.compile(r"Memory hits for this message|Pre-compact snapshot|## Transcript tail")
+RE_BASE64RUN = re.compile(r"[A-Za-z0-9+/]{120,}={0,2}")
+RE_H1 = re.compile(r"^#\s+(.+)$")
+RE_DECISION = re.compile(
+    r"\b(decided|will|chose|switched|because|instead|plan|approach|root cause|fix(ed)?)\b", re.I
+)
 
 
 def read_hook_input() -> dict:
@@ -48,14 +75,18 @@ def read_hook_input() -> dict:
 def project_slug_from_cwd(cwd: str | None) -> str | None:
     """
     Claude Code stores per-project data under ~/.claude/projects/<slug>/.
-    The slug is the full cwd with every `:`, `/`, `\\`, and `.` mapped to `-`,
-    then leading dashes stripped. Examples:
-        D:\\projects\\my-app                  → D--projects-my-app
-        D:\\projects\\my-app\\.claude\\w\\x   → D--projects-my-app--claude-w-x
+    The slug is the full cwd with every `:`, `/`, `\\`, `.`, AND whitespace
+    mapped to `-`, then leading dashes stripped. The whitespace mapping is
+    essential: a path like "D:\\CLAUDE\\My App" becomes "D--CLAUDE-My-App"
+    (matching Claude Code's own slug) — without it the space survived and the
+    memory lookup silently fell back to the PARENT project's memory. Examples:
+        D:\\CLAUDE\\my-project                 → D--CLAUDE-my-project
+        D:\\CLAUDE\\My App                     → D--CLAUDE-My-App
+        D:\\CLAUDE\\my-project\\.claude\\w\\x  → D--CLAUDE-my-project--claude-w-x
     """
     if not cwd:
         return None
-    slug = re.sub(r"[:\\/.]", "-", cwd)
+    slug = re.sub(r"[:\\/.\s]", "-", cwd)
     return slug.lstrip("-")
 
 
@@ -68,7 +99,7 @@ def find_memory_dir(cwd: str | None) -> Path | None:
     if mem.exists() and mem.is_dir():
         return mem
     # Fallback 1: worktrees share memory with their parent repo
-    # e.g. D--projects-my-app--claude-worktrees-lucid-brattain → parent
+    # e.g. D--CLAUDE-my-project--claude-worktrees-lucid-brattain → parent
     parts = slug.split("--claude-worktrees-")
     if len(parts) == 2:
         parent_slug = parts[0]
@@ -104,32 +135,93 @@ def extract_keywords(text: str, min_len: int = MIN_KEYWORD_LEN) -> set[str]:
     return {w.lower() for w in words if w.lower() not in STOP}
 
 
-def score_file(path: Path, keywords: set[str]) -> int:
-    """Keyword-hit count for a single file; 0 if unreadable."""
+def score_file(path: Path, keywords: set[str]) -> float:
+    """
+    Relevance score for one file (0.0 if unreadable / no hit).
+    base = Σ min(count(k), TF_CAP)  — caps keyword spam
+    × coverage (distinct keywords present ^1.5) — rewards files covering more of the query
+    × title_boost (1.5 if a keyword is in the H1)
+    × proximity_boost (1.3 if ≥2 distinct keywords co-occur within 200 chars)
+    × freshness (0.6–1.0 by mtime age)
+    Returns a float; callers only consume the returned Path list so the type is contained.
+    """
     if not keywords:
-        return 0
+        return 0.0
     try:
-        text = path.read_text(encoding="utf-8", errors="ignore").lower()
+        text = path.read_text(encoding="utf-8", errors="ignore")
     except Exception:
-        return 0
-    score = 0
+        return 0.0
+    low = text.lower()
+    base = 0
+    present = 0
     for k in keywords:
-        score += text.count(k)
-    return score
+        c = low.count(k)
+        if c:
+            present += 1
+            base += min(c, TF_CAP)
+    if base == 0:
+        return 0.0
+
+    coverage = present ** 1.5
+
+    title_boost = 1.0
+    for line in text.split("\n")[:12]:
+        m = RE_H1.match(line)
+        if m and any(k in m.group(1).lower() for k in keywords):
+            title_boost = 1.5
+            break
+
+    prox_boost = 1.0
+    if present >= 2:
+        positions = sorted(
+            (low.find(k), k) for k in keywords if low.find(k) >= 0
+        )
+        for i in range(len(positions)):
+            window = {positions[i][1]}
+            for j in range(i + 1, len(positions)):
+                if positions[j][0] - positions[i][0] <= 200:
+                    window.add(positions[j][1])
+                else:
+                    break
+            if len(window) >= 2:
+                prox_boost = 1.3
+                break
+
+    try:
+        age_days = max(0.0, (time.time() - path.stat().st_mtime) / 86400.0)
+    except Exception:
+        age_days = 0.0
+    freshness = 0.6 + 0.4 / (1 + age_days / 14.0)
+
+    return base * coverage * title_boost * prox_boost * freshness
 
 
 def grep_memory(mem_dir: Path, keywords: set[str], max_files: int = 3) -> list[Path]:
-    """Return top-K .md files sorted by keyword relevance."""
+    """Return top-K .md files by relevance, skipping transcript-noise dumps and
+    de-duplicating near-identical notes (same prose fingerprint)."""
     if not mem_dir.exists():
         return []
-    results: list[tuple[int, Path]] = []
+    results: list[tuple[float, Path]] = []
     for md in mem_dir.rglob("*.md"):
+        if is_noise_file(md):  # never inject base64/JSONL garbage
+            continue
         score = score_file(md, keywords)
         if score > 0:
             results.append((score, md))
     # Sort by score desc, then by mtime desc (newer wins ties)
     results.sort(key=lambda pair: (pair[0], pair[1].stat().st_mtime), reverse=True)
-    return [p for _, p in results[:max_files]]
+    out: list[Path] = []
+    seen: set[str] = set()
+    for _, p in results:
+        fp = _prose_fingerprint(p)
+        if fp and fp in seen:
+            continue
+        if fp:
+            seen.add(fp)
+        out.append(p)
+        if len(out) >= max_files:
+            break
+    return out
 
 
 def extract_snippet(path: Path, keywords: set[str], max_chars: int = BUDGET_SNIPPET) -> str:
@@ -142,13 +234,19 @@ def extract_snippet(path: Path, keywords: set[str], max_chars: int = BUDGET_SNIP
     except Exception:
         return ""
 
-    lines = text.split("\n")
+    raw = text.split("\n")
     # Pull title (first H1 line) if present
     title = ""
-    for line in lines[:10]:
+    for line in raw[:10]:
         if line.startswith("# "):
             title = line.strip()
             break
+
+    # Drop transcript-noise lines (base64/JSONL/self-injected blocks) so a snippet
+    # never spends the budget on garbage.
+    lines = [line for line in raw if not is_noise_line(line)]
+    if not lines:
+        return ""
 
     # Find first keyword hit; take surrounding 10 lines
     lower_lines = [line.lower() for line in lines]
@@ -176,19 +274,25 @@ def extract_snippet(path: Path, keywords: set[str], max_chars: int = BUDGET_SNIP
 
 
 def latest_session_note(mem_dir: Path) -> Path | None:
-    """Find the most recently modified file in memory/sessions/."""
+    """Most recent REAL session note in memory/sessions/ — excludes transcript-noise
+    dumps so a fresh auto-compact garbage file can never hijack the SessionStart slot.
+    Returns None if only dumps exist."""
     sess_dir = mem_dir / "sessions"
     if not sess_dir.exists():
         return None
-    candidates = list(sess_dir.rglob("*.md"))
+    candidates = [p for p in sess_dir.rglob("*.md") if not is_noise_file(p)]
     if not candidates:
         return None
     candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return candidates[0]
 
 
-def memory_index(mem_dir: Path, max_chars: int = 4000) -> str | None:
-    """Read MEMORY.md index, clip to budget."""
+def memory_index(mem_dir: Path, max_chars: int = 3000, max_line: int = 160) -> str | None:
+    """Read MEMORY.md index and return a LEAN, scannable version: each line is
+    clipped to max_line chars so long session bullets become titles+hooks rather
+    than paragraphs (the full detail lives in the session files, loaded only on
+    recall). Keeps the whole map (every entry) while spending far fewer tokens —
+    'see it faster, burn less'."""
     idx = mem_dir / "MEMORY.md"
     if not idx.exists():
         return None
@@ -196,6 +300,12 @@ def memory_index(mem_dir: Path, max_chars: int = 4000) -> str | None:
         text = idx.read_text(encoding="utf-8", errors="ignore")
     except Exception:
         return None
+    out: list[str] = []
+    for line in text.split("\n"):
+        if len(line) > max_line:
+            line = line[: max_line - 1].rstrip() + "…"
+        out.append(line)
+    text = "\n".join(out)
     if len(text) > max_chars:
         text = text[: max_chars - 15].rstrip() + "\n[...truncated]"
     return text
@@ -228,187 +338,247 @@ def log_err(msg: str) -> None:
     sys.stderr.write(f"[megamind] {msg}\n")
 
 
-# ────────────────────────────────────────────────────────────────────
-# CLI helpers — remember / forget / audit / stats / init
-# ────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+# ULTRA: noise detection — keep base64 / JSONL transcript garbage out of recall
+# ══════════════════════════════════════════════════════════════════════════
 
-def ensure_memory_dir(cwd: str | None) -> Path:
-    """
-    Ensure memory dir exists for this project — create MEMORY.md skeleton
-    if missing. Returns the memory dir path. Never raises for permission.
-    """
-    slug = project_slug_from_cwd(cwd)
-    if not slug:
-        raise ValueError("cannot derive project slug from cwd")
-    mem = PROJECTS_ROOT / slug / "memory"
-    mem.mkdir(parents=True, exist_ok=True)
-    idx = mem / "MEMORY.md"
-    if not idx.exists():
-        idx.write_text(
-            "# Project memory index\n\n"
-            "Newest entries first. One line per fact, tag with emoji.\n\n",
-            encoding="utf-8",
-        )
-    return mem
+def is_noise_line(line: str) -> bool:
+    """A single line that is transcript noise (JSONL row, self-injected block,
+    or a long base64 run with no spaces)."""
+    if RE_JSONL.search(line) or RE_SELFINJECT.search(line):
+        return True
+    if RE_BASE64RUN.search(line) and " " not in line.strip():
+        return True
+    return False
 
 
-def append_memory_line(mem_dir: Path, text: str, tag: str = "📦") -> str:
-    """
-    Append a one-line fact to MEMORY.md. Returns the line written.
-    Deduplicates: if the same text is already there, no-op.
-    """
-    idx = mem_dir / "MEMORY.md"
-    existing = idx.read_text(encoding="utf-8", errors="ignore") if idx.exists() else ""
-    stamp = datetime.now().strftime("%Y-%m-%d")
-    line = f"- {tag} [{stamp}] {text.strip()}\n"
-    if line.strip() in existing:
-        return line
-    with idx.open("a", encoding="utf-8") as f:
-        f.write(line)
-    return line
+def is_noise_file(path: Path) -> bool:
+    """Whether a memory file is a raw transcript dump (so recall/SessionStart skip it).
+    Filename match is anchored to PreCompact's real stems ONLY (never loose substrings
+    like 'auto-' that would false-positive on titles like 'Auto-deploy'); otherwise a
+    content sniff over the first 4KB with an absolute noisy-line floor."""
+    name = path.name
+    if name.startswith("_compact-") or re.search(r"compact-(auto|manual)", name):
+        return True
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            head = f.read(4096)
+    except Exception:
+        return False  # transient Windows/OneDrive lock — never silently drop a note
+    lines = [ln for ln in head.split("\n") if ln.strip()]
+    if len(lines) < NOISE_MIN_NOISY_LINES:
+        return False
+    noisy = sum(1 for ln in lines if is_noise_line(ln))
+    return noisy >= NOISE_MIN_NOISY_LINES and (noisy / len(lines)) >= NOISE_LINE_RATIO
 
 
-def forget_memory_line(mem_dir: Path, query: str) -> list[str]:
-    """
-    Remove lines from MEMORY.md matching query (case-insensitive).
-    Returns the removed lines (may be empty).
-    """
-    idx = mem_dir / "MEMORY.md"
-    if not idx.exists():
-        return []
-    lines = idx.read_text(encoding="utf-8", errors="ignore").splitlines(keepends=True)
-    q = query.lower().strip()
-    if not q:
-        return []
-    kept: list[str] = []
-    removed: list[str] = []
-    for line in lines:
-        if line.strip().startswith("-") and q in line.lower():
-            removed.append(line)
+def _prose_fingerprint(path: Path) -> str:
+    """First 3 clean, non-heading lines, lowercased — for dedup of near-identical notes."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
+    picked: list[str] = []
+    for line in text.split("\n"):
+        s = line.strip()
+        if not s or s.startswith("#") or is_noise_line(s):
+            continue
+        picked.append(s)
+        if len(picked) >= 3:
+            break
+    return " ".join(picked).lower()[:160]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ULTRA: PreCompact clean resume — parse the transcript, strip base64/tool JSON,
+# emit a small structured snapshot instead of dumping a raw 20KB byte-tail.
+# ══════════════════════════════════════════════════════════════════════════
+
+def _looks_binary(s: str) -> bool:
+    head = s[:24]
+    if head.startswith(("/9j/", "iVBOR", "H4sI", "data:image")):
+        return True
+    sample = s[:400]
+    if len(sample) >= 200:
+        b64 = sum(1 for c in sample if c.isalnum() or c in "+/=")
+        if b64 / len(sample) > 0.97 and " " not in sample:
+            return True
+    return False
+
+
+def clean_tool_result(block: dict) -> str:
+    """First useful line of a tool_result, or '' — DROPS image blocks and base64
+    blobs. On an image block it CONTINUES (so a mixed image+text result keeps its text)."""
+    rc = block.get("content")
+    parts = rc if isinstance(rc, list) else [rc]
+    for x in parts:
+        if isinstance(x, dict):
+            if x.get("type") == "image":
+                continue
+            if x.get("type") == "text":
+                t = x.get("text", "")
+            else:
+                continue
+        elif isinstance(x, str):
+            t = x
         else:
-            kept.append(line)
-    if removed:
-        idx.write_text("".join(kept), encoding="utf-8")
-    return removed
-
-
-# Patterns that strongly suggest a secret has leaked into memory.
-# False-positive rate is non-zero; audit output is advisory, not blocking.
-SECRET_PATTERNS: list[tuple[str, re.Pattern]] = [
-    ("stripe-live",        re.compile(r"\bsk_live_[A-Za-z0-9]{16,}")),
-    ("stripe-test",        re.compile(r"\bsk_test_[A-Za-z0-9]{16,}")),
-    ("stripe-restricted",  re.compile(r"\brk_live_[A-Za-z0-9]{16,}")),
-    ("github-pat",         re.compile(r"\bghp_[A-Za-z0-9]{30,}")),
-    ("github-oauth",       re.compile(r"\bgho_[A-Za-z0-9]{30,}")),
-    ("google-api",         re.compile(r"\bAIza[A-Za-z0-9_-]{30,}")),
-    ("openai",             re.compile(r"\bsk-[A-Za-z0-9]{40,}")),
-    ("anthropic",          re.compile(r"\bsk-ant-[A-Za-z0-9_-]{40,}")),
-    ("aws-access",         re.compile(r"\bAKIA[A-Z0-9]{16}")),
-    ("slack-bot",          re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}")),
-    ("jwt",                re.compile(r"\beyJ[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{15,}")),
-    ("private-key-header", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
-    ("password-assign",    re.compile(r"(?i)\bpassword\s*[:=]\s*['\"][^'\"]{6,}['\"]")),
-    ("api-key-assign",     re.compile(r"(?i)\b(?:api[_-]?key|secret[_-]?key)\s*[:=]\s*['\"][A-Za-z0-9_-]{16,}['\"]")),
-    ("bearer-token",       re.compile(r"\bBearer\s+[A-Za-z0-9_-]{20,}")),
-]
-
-
-def scan_secrets(mem_dir: Path) -> list[tuple[Path, str, int, str]]:
-    """
-    Walk memory dir, return list of (file, pattern_name, line_no, matched_snippet).
-    Advisory — not every match is a real secret, but every real secret matches.
-    """
-    hits: list[tuple[Path, str, int, str]] = []
-    for md in mem_dir.rglob("*.md"):
-        try:
-            text = md.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
             continue
-        for line_no, line in enumerate(text.splitlines(), start=1):
-            for name, pat in SECRET_PATTERNS:
-                m = pat.search(line)
-                if m:
-                    snippet = m.group(0)
-                    if len(snippet) > 40:
-                        snippet = snippet[:20] + "…" + snippet[-10:]
-                    hits.append((md, name, line_no, snippet))
-    return hits
+        t = (t or "").strip()
+        if not t or _looks_binary(t):
+            continue
+        return t.splitlines()[0][:TOOL_RESULT_MAX_CHARS]
+    return ""
 
 
-# ────────────────────────────────────────────────────────────────────
-# Stats — hook fire counts + token savings estimate
-# ────────────────────────────────────────────────────────────────────
-
-STATS_FILE = ".megamind-stats.json"
-
-# Reasonable per-event averages (conservative)
-TOKENS_SAVED_PER_SESSION_START = 1200  # typical re-explain avoided
-TOKENS_SAVED_PER_PROMPT_HIT = 500      # typical context paste avoided
-TOKENS_SAVED_PER_COMPACT = 800         # typical manual tail summary avoided
+def _strip_noise_prose(s: str) -> str:
+    s = re.sub(r"```.*?```", "[code]", s, flags=re.S)
+    s = re.sub(r"<system-reminder>.*?</system-reminder>", "", s, flags=re.S)
+    return re.sub(r"\s+", " ", s).strip()
 
 
-def stats_file(mem_dir: Path) -> Path:
-    return mem_dir / STATS_FILE
-
-
-def load_stats(mem_dir: Path) -> dict:
-    f = stats_file(mem_dir)
-    if not f.exists():
-        return {}
+def iter_transcript_blocks(transcript_path: str) -> list[dict]:
+    """Stream the JSONL transcript line-by-line into a bounded deque of normalized
+    content blocks (text / thinking / tool_use / tool_result). [] on any IOError."""
+    dq: deque = deque(maxlen=RESUME_TAIL_MESSAGES)
     try:
-        return json.loads(f.read_text(encoding="utf-8"))
+        with open(transcript_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:  # lazy — bounded memory even on multi-MB transcripts
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                msg = obj.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                role = msg.get("role")
+                content = msg.get("content")
+                if isinstance(content, str):
+                    dq.append({"role": role, "kind": "text", "text": content})
+                elif isinstance(content, list):
+                    for b in content:
+                        if not isinstance(b, dict):
+                            continue
+                        bt = b.get("type")
+                        if bt == "text":
+                            dq.append({"role": role, "kind": "text", "text": b.get("text", "")})
+                        elif bt == "thinking":
+                            dq.append({"role": role, "kind": "thinking", "text": b.get("thinking", "")})
+                        elif bt == "tool_use":
+                            dq.append({"role": role, "kind": "tool_use", "name": b.get("name", ""), "input": b.get("input") or {}})
+                        elif bt == "tool_result":
+                            dq.append({"role": role, "kind": "tool_result", "block": b})
     except Exception:
-        return {}
-
-
-def bump_stat(mem_dir: Path, key: str, delta: int = 1) -> None:
-    """Increment a counter. Silent on any error (stats are non-critical)."""
-    try:
-        data = load_stats(mem_dir)
-        data[key] = data.get(key, 0) + delta
-        data["last_updated"] = now_iso()
-        stats_file(mem_dir).write_text(json.dumps(data, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-
-
-def estimate_tokens_saved(stats: dict) -> int:
-    s = stats.get("session_start", 0) * TOKENS_SAVED_PER_SESSION_START
-    s += stats.get("prompt_hit", 0) * TOKENS_SAVED_PER_PROMPT_HIT
-    s += stats.get("compact", 0) * TOKENS_SAVED_PER_COMPACT
-    return s
-
-
-# ────────────────────────────────────────────────────────────────────
-# Templates — project-type starter kits
-# ────────────────────────────────────────────────────────────────────
-
-TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
-
-
-def list_templates() -> list[str]:
-    if not TEMPLATES_DIR.exists():
         return []
-    return sorted(p.name for p in TEMPLATES_DIR.iterdir() if p.is_dir())
+    return list(dq)
 
 
-def copy_template(name: str, mem_dir: Path) -> int:
-    """
-    Copy all files from templates/<name>/ into mem_dir. Does not overwrite
-    existing files. Returns number of files created.
-    """
-    src = TEMPLATES_DIR / name
-    if not src.exists() or not src.is_dir():
-        raise FileNotFoundError(f"no such template: {name}")
-    created = 0
-    for entry in src.rglob("*"):
-        if entry.is_dir():
-            continue
-        rel = entry.relative_to(src)
-        dst = mem_dir / rel
-        if dst.exists():
-            continue
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        dst.write_bytes(entry.read_bytes())
-        created += 1
-    return created
+def build_resume(records: list[dict]) -> str:
+    """Bucket transcript blocks into a clean structured resume (≤BUDGET_PRECOMPACT)."""
+    decisions: list[str] = []
+    files: list[str] = []
+    cmds: list[str] = []
+    intents: list[str] = []
+    questions: list[str] = []
+
+    def add(lst: list[str], v) -> None:
+        if v and v not in lst:
+            lst.append(v)
+
+    for r in records:
+        k = r.get("kind")
+        if k == "tool_use":
+            n = r.get("name")
+            inp = r.get("input") or {}
+            if n in ("Edit", "Write", "NotebookEdit"):
+                add(files, inp.get("file_path") or inp.get("notebook_path"))
+            elif n == "Read":
+                add(files, inp.get("file_path"))
+            elif n in ("Bash", "PowerShell"):
+                add(cmds, (inp.get("command") or "")[:120])
+        elif k == "text" and r.get("role") == "user":
+            t = _strip_noise_prose(r.get("text", ""))
+            if t and not t.startswith("[Request interrupted") and not t.startswith("<"):
+                intents.append(t[:200])
+                if "?" in t:
+                    questions.append(t[:200])
+        elif k == "text" and r.get("role") == "assistant":
+            t = _strip_noise_prose(r.get("text", ""))
+            if t and RE_DECISION.search(t):
+                decisions.append(t[:200])
+
+    def tail_uniq(xs: list[str], n: int) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for x in reversed(xs):
+            if x and x not in seen:
+                seen.add(x)
+                out.append(x)
+        return list(reversed(out))[-n:]
+
+    sections = [
+        ("Recent intent", tail_uniq(intents, 4)),
+        ("Decisions / rationale", tail_uniq(decisions, 6)),
+        ("Files touched", tail_uniq(files, 12)),
+        ("Commands run", tail_uniq(cmds, 8)),
+        ("Open questions", tail_uniq(questions, 4)),
+    ]
+    out: list[str] = []
+    for nm, items in sections:
+        if items:
+            out.append(f"### {nm}\n" + "\n".join(f"- {i}" for i in items))
+    body = "\n\n".join(out)
+    return format_budget(body, BUDGET_PRECOMPACT) if body else ""
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ULTRA: lean mode (token-discipline directive, opt-out) + memory-vault sync
+# ══════════════════════════════════════════════════════════════════════════
+
+LEAN_LINE = (
+    "Lean mode — to save tokens: route big reads (>~400 lines or >3 files) to a "
+    "subagent and keep only the conclusion; `/clear` on an unrelated task switch; "
+    "recall from memory before asking the user to re-explain; load MCP/skill tools "
+    "only when the task needs them."
+)
+
+
+def lean_on() -> bool:
+    """Lean directive is default-ON; opt out by creating ~/.claude/megamind-lean.off."""
+    return not (CLAUDE_HOME / "megamind-lean.off").exists()
+
+
+VAULT_DIR = Path(
+    os.environ.get("MEGAMIND_VAULT_DIR") or (Path.home() / "Documents" / "GitHub" / "memory-vault")
+)
+SYNC_DEBOUNCE_SEC = int(os.environ.get("MEGAMIND_SYNC_DEBOUNCE") or 900)
+# Default OFF: vault.sync() calls git directly (bypassing Claude's pre-commit secret
+# hook) and your memory-vault repo may be public — opt in only after accepting the inline scan.
+AUTOSYNC_ON = os.environ.get("MEGAMIND_AUTOSYNC", "0") == "1"
+
+_SECRET_RE = re.compile(
+    r"(sk-[A-Za-z0-9]{16,}"
+    r"|ghp_[A-Za-z0-9]{20,}"
+    r"|AKIA[0-9A-Z]{12,}"
+    r"|xox[baprs]-[A-Za-z0-9-]{10,}"
+    r"|AIza[0-9A-Za-z_\-]{20,}"
+    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----)"
+)
+
+
+def scan_secrets(text: str) -> bool:
+    """True if the text appears to contain a credential (best-effort, stdlib regex)."""
+    return bool(_SECRET_RE.search(text or ""))
+
+
+def git_quiet(args: list[str], cwd: Path, timeout: int = 10) -> tuple[int, str]:
+    """Run a git command; never raises. Returns (returncode, combined stdout+stderr)."""
+    try:
+        p = subprocess.run(
+            ["git", *args], cwd=str(cwd), capture_output=True, text=True, timeout=timeout
+        )
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except Exception as exc:
+        return 1, str(exc)

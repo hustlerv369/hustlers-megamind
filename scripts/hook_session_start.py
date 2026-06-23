@@ -17,27 +17,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from lib import (
     BUDGET_SESSION_START,
-    bump_stat,
+    LEAN_LINE,
     find_memory_dir,
     format_budget,
     latest_session_note,
+    lean_on,
     memory_index,
     read_hook_input,
 )
-from sync import autopull_if_due
 
 
 def main() -> None:
     payload = read_hook_input()
     cwd = payload.get("cwd")
-
-    # Best-effort: if the user has vault sync on, pull fresh memory from
-    # other devices before loading. Silent on any failure (offline, auth).
-    try:
-        autopull_if_due()
-    except Exception:
-        pass
-
     mem = find_memory_dir(cwd)
     if not mem:
         # Silent — project has no memory yet, nothing to inject.
@@ -45,7 +37,7 @@ def main() -> None:
 
     parts: list[str] = []
 
-    idx = memory_index(mem, max_chars=4000)
+    idx = memory_index(mem, max_chars=3000)
     if idx:
         parts.append("## 🧠 Project memory index\n" + idx)
 
@@ -56,12 +48,20 @@ def main() -> None:
         except Exception:
             body = ""
         if body:
-            # Clip to ~2000 chars (~500 tokens)
-            if len(body) > 2000:
-                body = body[:1985].rstrip() + "\n[...truncated]"
+            # Clip to ~1300 chars (~325 tokens). The new PreCompact resumes are
+            # already small + clean, so this rarely truncates — it just caps the
+            # latest-note slot so a long hand-written note can't bloat startup.
+            if len(body) > 1300:
+                body = body[:1285].rstrip() + "\n[...truncated]"
             parts.append(
                 f"## 📓 Most recent session note — `{latest.name}`\n{body}"
             )
+
+    # Lean directive last → it lands in the trimmable tail, so under budget
+    # pressure the real memory body is kept and this ~50-token line is dropped
+    # first (format_budget clips the END). Opt out via ~/.claude/megamind-lean.off.
+    if lean_on():
+        parts.append("## ⚡ Lean mode\n" + LEAN_LINE)
 
     if not parts:
         return
@@ -80,7 +80,6 @@ def main() -> None:
 
     # stdout = additionalContext for SessionStart / UserPromptSubmit hooks
     sys.stdout.write(full)
-    bump_stat(mem, "session_start")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,8 @@
+# megamind-keep.txt — skills that must STAY enabled (never lazy-disabled).
+# One skill name per line. Lines starting with '#' are comments.
+# 'megamind' is always protected automatically; list any others you use daily.
+# Copy this file to ~/.claude/megamind-keep.txt and edit.
+#
+# Example:
+# your-design-skill
+# my-favorite-skill

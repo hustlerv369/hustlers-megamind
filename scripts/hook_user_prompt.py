@@ -22,7 +22,6 @@ from lib import (
     BUDGET_SNIPPET,
     BUDGET_USER_PROMPT,
     MIN_KEYWORDS,
-    bump_stat,
     extract_keywords,
     extract_snippet,
     find_memory_dir,
@@ -43,12 +42,10 @@ def main() -> None:
 
     keywords = extract_keywords(prompt)
     if len(keywords) < MIN_KEYWORDS:
-        bump_stat(mem, "prompt_miss")
         return
 
     matches = grep_memory(mem, keywords, max_files=3)
     if not matches:
-        bump_stat(mem, "prompt_miss")
         return
 
     lines: list[str] = ["## 🧠 Memory hits for this message"]
@@ -64,7 +61,6 @@ def main() -> None:
 
     out = format_budget("".join(lines), BUDGET_USER_PROMPT)
     sys.stdout.write(out)
-    bump_stat(mem, "prompt_hit")
 
 
 if __name__ == "__main__":

@@ -83,6 +83,31 @@ def strip_existing(entries: list, marker: str) -> list:
     return out
 
 
+def warn_contextmode_global() -> None:
+    """Megamind owns all 5 lifecycle hooks. If context-mode is registered GLOBALLY
+    it adds 11 tool schemas to every request + duplicate hooks on the same events —
+    the worst cost shape on a 1M-context metered plan. Warn so it stays npm-only +
+    per-project (.mcp.json) with hooks disabled."""
+    try:
+        settings = load_settings()
+        mcp = settings.get("mcpServers") or {}
+        hooks = settings.get("hooks") or {}
+        hit = any("context-mode" in k.lower() or k.lower() == "ctx" for k in mcp)
+        for entries in hooks.values():
+            for e in entries or []:
+                for h in e.get("hooks") or []:
+                    cmd = (h.get("command") or "").lower()
+                    if "context-mode" in cmd:
+                        hit = True
+        if hit:
+            print("\n⚠  context-mode appears registered GLOBALLY in settings.json.")
+            print("   Keep it npm-only + per-project (.mcp.json) with hooks disabled —")
+            print("   a global install collides with megamind's 5 hooks and bloats every")
+            print("   request with 11 tool schemas. See megamind SKILL.md → Lean Mode.")
+    except Exception:
+        pass
+
+
 def install() -> None:
     settings = load_settings()
     hooks = settings.setdefault("hooks", {})
@@ -102,6 +127,7 @@ def install() -> None:
     save_settings(settings)
     print(f"\nInstalled. Backup of previous settings saved alongside {SETTINGS}.")
     print("Restart Claude Code (or open a new session) for hooks to take effect.")
+    warn_contextmode_global()
 
 
 def uninstall() -> None:
