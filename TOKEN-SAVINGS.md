@@ -4,6 +4,40 @@ A plain-English summary of the v0.2.0 "Ultra" overhaul: what each change does an
 roughly how many tokens it saves per session. Measured on a real setup (175 skills,
 Max plan, `opus[1m]` + `xhigh`, 8.3 MB live transcript).
 
+## v0.3.0 "Deltas-only" — the per-turn drain nobody had fixed
+
+v0.2.0 found that memory hooks weren't the main sink. But one real per-turn leak
+remained: **the UserPromptSubmit hook re-injected the SAME matching note on nearly
+every message** — it had no memory of what it had already surfaced. A note Claude
+has already seen is carried forward for free in the cached conversation prefix, so
+re-injecting it adds zero information and costs tokens.
+
+Why it hurt more than its size suggests — Anthropic prompt cache (verified):
+cache **write = 1.25×** base input, cache **read = 0.1×**, **5-min TTL** that
+refreshes free on every read. Continuous traffic is cheap; but **bursty usage with
+>5-min gaps lets the cache go COLD**, and a cold turn re-charges the ENTIRE
+accumulated prefix at full **1×**. With no cross-turn dedup the prefix grows
+**O(N²)** in duplicate copies — a 20-turn cold-burst session re-charges ~84k
+full-price tokens of pure duplication vs ~8k with dedup (**~10× waste**).
+
+The fix — "load once at SessionStart, inject deltas only":
+
+| Change | Effect |
+|--------|--------|
+| **Per-session inject ledger** (`~/.claude/.megamind/seen/<session>.json`) | A file is injected **at most once per session**; collapses the O(N²) duplicate cost to O(N) |
+| **SessionStart pre-seeds the ledger** with the index + latest resume it loads | The per-turn hook never re-injects working memory already in the cache-stable prefix |
+| **Relevance gate** (coverage + score floor) on the inject path | Weak/irrelevant matches inject **nothing** |
+| **Acronym keywords** (KDP, TCG…) kept; length-weighted scoring | Short high-signal queries match the RIGHT note or stay silent |
+
+Net: **most turns now inject zero tokens.** Per-turn injection drops from ~400 tok
+every turn to ~0 on repeat/irrelevant turns; a genuinely new, relevant note still
+surfaces exactly once. Everything from v0.2.0 (and vault sync, lean mode, noise
+filtering, PreCompact resume) is preserved untouched. 42 tests pass.
+
+---
+
+## v0.2.0 "Ultra" (below)
+
 ## The realization
 
 Memory was **never** the token sink — Megamind's hooks are capped at ~1,900 tokens/

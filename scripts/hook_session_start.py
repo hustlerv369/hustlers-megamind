@@ -22,8 +22,13 @@ from lib import (
     format_budget,
     latest_session_note,
     lean_on,
+    load_seen,
     memory_index,
+    norm_relpath,
+    prune_old_ledgers,
     read_hook_input,
+    save_seen,
+    session_key,
 )
 
 
@@ -65,6 +70,24 @@ def main() -> None:
 
     if not parts:
         return
+
+    # Pre-seed the per-session inject ledger with what we load HERE (index + latest
+    # resume note), so the per-turn UserPromptSubmit hook never re-injects this
+    # working-memory content — it already lives in this cache-stable SessionStart
+    # prefix. Disk-only (0 tokens added to the payload), fully fail-silent.
+    try:
+        prune_old_ledgers()
+        sid = session_key(payload)
+        if sid:
+            seed: set[str] = set()
+            if idx:
+                seed.add("MEMORY.md")
+            if latest is not None and body:
+                seed.add(norm_relpath(latest.relative_to(mem)))
+            if seed:
+                save_seen(sid, load_seen(sid) | seed)
+    except Exception:
+        pass
 
     # Preamble gives Claude clear instructions on how to use this context.
     preamble = (

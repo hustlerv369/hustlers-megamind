@@ -2,15 +2,20 @@
 """
 UserPromptSubmit hook — runs on every user message.
 
-Strategy: extract keywords (≥4 chars) from the user's message, grep the
-project memory dir for relevance, inject top 3 matching snippets.
+Strategy (Ultra v2 — "inject deltas only"): extract keywords from the user's
+message, grep the project memory dir with the STRICT inject gate (coverage +
+relevance floor), then inject ONLY files not already surfaced this session. A
+note injected once is carried forward for free in the cached conversation
+prefix, so re-injecting it every turn is pure waste — the per-session ledger
+collapses that O(N²) duplicate cost to O(N).
 
 Silent no-op when:
   - No memory dir for this project
   - <2 keywords in user message (low signal → skip injection)
-  - No file scores >0
+  - No file clears the coverage gate + relevance floor
+  - Every relevant file was already injected this session (nothing NEW)
 
-Token budget: ~400 tokens (1600 chars) total.
+Token budget: ~400 tokens (1600 chars) total. Most turns now inject NOTHING.
 """
 from __future__ import annotations
 
@@ -27,8 +32,15 @@ from lib import (
     find_memory_dir,
     format_budget,
     grep_memory,
+    load_seen,
+    norm_relpath,
+    prune_old_ledgers,
     read_hook_input,
+    save_seen,
+    session_key,
 )
+
+HEADER = "## 🧠 Memory hits for this message"
 
 
 def main() -> None:
@@ -44,23 +56,41 @@ def main() -> None:
     if len(keywords) < MIN_KEYWORDS:
         return
 
-    matches = grep_memory(mem, keywords, max_files=3)
+    # Strict inject gate: coverage + relevance floor (kills weak/irrelevant hits).
+    matches = grep_memory(mem, keywords, max_files=3, inject=True)
     if not matches:
         return
 
-    lines: list[str] = ["## 🧠 Memory hits for this message"]
-    used = len(lines[0])
+    # Cross-turn dedup: skip any file already injected this session (or pre-seeded
+    # by SessionStart). Fail-silent — missing session id → empty set → no dedup.
+    sid = session_key(payload)
+    seen = load_seen(sid)
+
+    blocks: list[str] = []
+    emitted: set[str] = set()
+    used = len(HEADER)
     for md in matches:
         rel = md.relative_to(mem)
+        key = norm_relpath(rel)
+        if key in seen:  # already in context this session — re-injecting is waste
+            continue
         snip = extract_snippet(md, keywords, max_chars=BUDGET_SNIPPET)
         block = f"\n\n**{rel}**\n\n{snip}"
         if used + len(block) > BUDGET_USER_PROMPT:
             break
-        lines.append(block)
+        blocks.append(block)
+        emitted.add(key)
         used += len(block)
 
-    out = format_budget("".join(lines), BUDGET_USER_PROMPT)
+    if not blocks:  # nothing NEW survived — emit nothing (not even the header)
+        return
+
+    out = format_budget(HEADER + "".join(blocks), BUDGET_USER_PROMPT)
     sys.stdout.write(out)
+
+    # Record what we injected so later turns don't repeat it; bound the dir.
+    save_seen(sid, seen | emitted)
+    prune_old_ledgers()
 
 
 if __name__ == "__main__":

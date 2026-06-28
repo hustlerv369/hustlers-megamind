@@ -4,6 +4,45 @@ All notable changes to Megamind Ultra are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-06-28 — "Deltas-only"
+
+Kills the real per-turn drain: the UserPromptSubmit hook was re-injecting the
+SAME matching note on (nearly) every message with no memory of what it had
+already surfaced. Under Anthropic's 5-min cache TTL and bursty usage (>5-min
+gaps → cache goes cold → the whole accumulated prefix is re-charged at full 1×),
+that duplicate injection grows the prefix O(N²). This release makes injection
+"load once at SessionStart, inject deltas only" — collapsing it to O(N).
+
+### Added
+- **Per-session inject ledger** (`CLAUDE_HOME/.megamind/seen/<session>.json`): a
+  fail-silent set of relpaths already injected this session. `session_key`,
+  `load_seen`, `save_seen`, `prune_old_ledgers` (24h self-prune), `norm_relpath`.
+  Stored OUTSIDE any project memory dir so it can never be picked up by
+  `grep_memory`'s `*.md` scan, recall, or vault sync.
+- **Relevance gate on the inject path** (`grep_memory(..., inject=True)`): a
+  coverage gate (≥ `min(INJECT_MIN_COVERAGE, #keywords)` distinct hits) + a score
+  floor (`max(MIN_SCORE_ABS, MIN_SCORE_REL_FRAC × top)`) so weak/coincidental
+  matches inject nothing (fixes the "unrelated question pulls in a stale note" class).
+- **Acronym keywords:** `extract_keywords` now keeps high-signal ALL-CAPS tokens
+  (KDP, TCG, OG) the length gate previously dropped — the root cause of degenerate
+  short-query matches. `score_file_detail` length-weights terms (cheap IDF proxy).
+
+### Changed
+- **SessionStart pre-seeds the ledger** with the index + latest resume note it
+  loads, so the per-turn hook never re-surfaces working memory already in the
+  cache-stable prefix. SessionStart stdout bytes are unchanged (seed is disk-only).
+- **UserPromptSubmit emits nothing** (not even the header) when no NEW, relevant,
+  not-yet-seen file survives — most turns now inject zero tokens.
+
+### Preserved (unchanged)
+- PreCompact clean resume, noise/base64/JSONL filtering, prose-fingerprint dedup,
+  vault auto-sync, lean mode, slug mapping, and `score_file`'s single-float
+  contract for recall/other callers (the non-inject path is byte-identical).
+
+### Tests
+- 42 pass (9 new): acronym extraction, score_file_detail, inject floor + coverage
+  gate, ledger roundtrip + prune, session_key, norm_relpath.
+
 ## [0.2.0] — 2026-06-22 — "Ultra"
 
 The token-saving overhaul. Memory was never the token sink — raw transcript noise

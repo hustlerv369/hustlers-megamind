@@ -19,3 +19,7 @@ Thumbs.db
 .pytest_cache/
 /skills-disabled/
 megamind-keep.txt
+
+# Per-session inject ledger (v0.3.0) — runtime state, never committed
+.megamind/
+*.tmp

@@ -50,6 +50,16 @@ TF_CAP = 5                        # cap a single keyword's term-frequency contri
 NOISE_LINE_RATIO = 0.30           # frac of noisy lines that marks a file as garbage
 NOISE_MIN_NOISY_LINES = 6         # absolute floor so a tiny note isn't nuked
 
+# ── Ultra v2: relevance gating + per-session inject ledger ──
+# These ONLY affect the per-turn inject path (grep_memory(..., inject=True) used
+# by the UserPromptSubmit hook). Recall / other callers are unchanged.
+MIN_SCORE_ABS = 3.0               # absolute score floor — below this, never inject
+MIN_SCORE_REL_FRAC = 0.5          # keep only files >= this fraction of the top score
+INJECT_MIN_COVERAGE = 2           # require >= min(this, #keywords) distinct keyword hits
+ACRONYM_MIN_LEN = 2               # keep high-signal ALL-CAPS acronyms (KDP, TCG, OG, AWS)
+LEDGER_DIRNAME = "seen"           # under CLAUDE_HOME/.megamind/<LEDGER_DIRNAME>/
+LEDGER_MAX_AGE_SEC = 86400        # prune per-session inject ledgers older than 24h
+
 # Noise signatures. RE_JSONL = Claude Code transcript rows; RE_SELFINJECT =
 # megamind's own injected blocks (never re-ingest); RE_BASE64RUN = image/blob runs.
 RE_JSONL = re.compile(
@@ -120,10 +130,16 @@ def find_memory_dir(cwd: str | None) -> Path | None:
 
 
 def extract_keywords(text: str, min_len: int = MIN_KEYWORD_LEN) -> set[str]:
-    """Pull alphanumeric words ≥ min_len, lowercased, deduped."""
+    """Pull alphanumeric words ≥ min_len, lowercased, deduped.
+
+    Also unions high-signal ALL-CAPS acronyms (KDP, TCG, OG, AWS) of length
+    ≥ ACRONYM_MIN_LEN that the length gate would otherwise drop — they carry the
+    most query intent, and dropping them was the root cause of weak/irrelevant
+    matches (a short acronym query degenerating to leftover generic words)."""
     if not text:
         return set()
     words = re.findall(rf"[A-Za-z0-9_]{{{min_len},}}", text)
+    acronyms = re.findall(rf"\b[A-Z0-9]{{{ACRONYM_MIN_LEN},}}\b", text)
     # Drop common English/Czech stopwords (keeps budget clean)
     STOP = {
         "this", "that", "with", "from", "have", "will", "would", "could", "should",
@@ -132,35 +148,38 @@ def extract_keywords(text: str, min_len: int = MIN_KEYWORD_LEN) -> set[str]:
         "taky", "jestli", "protože", "protoze", "jsem", "jsme", "byla", "byly",
         "ktere", "vsechno", "něco", "něco", "ještě", "jeste", "dnes", "teda", "pořád",
     }
-    return {w.lower() for w in words if w.lower() not in STOP}
+    out = {w.lower() for w in words} | {a.lower() for a in acronyms}
+    return {w for w in out if w not in STOP}
 
 
-def score_file(path: Path, keywords: set[str]) -> float:
+def score_file_detail(path: Path, keywords: set[str]) -> tuple[float, int]:
     """
-    Relevance score for one file (0.0 if unreadable / no hit).
-    base = Σ min(count(k), TF_CAP)  — caps keyword spam
+    Relevance score for one file plus the distinct-keyword 'present' count.
+    base = Σ min(count(k), TF_CAP) × length_weight(k)  — caps keyword spam, and
+           length-weights so longer/rarer terms dominate (a cheap stdlib IDF proxy:
+           generic 4-char words contribute ~1×, a 10-char project term ~1.9×)
     × coverage (distinct keywords present ^1.5) — rewards files covering more of the query
     × title_boost (1.5 if a keyword is in the H1)
     × proximity_boost (1.3 if ≥2 distinct keywords co-occur within 200 chars)
     × freshness (0.6–1.0 by mtime age)
-    Returns a float; callers only consume the returned Path list so the type is contained.
+    Returns (score, present). The inject path uses 'present' to enforce a coverage gate.
     """
     if not keywords:
-        return 0.0
+        return (0.0, 0)
     try:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except Exception:
-        return 0.0
+        return (0.0, 0)
     low = text.lower()
-    base = 0
+    base = 0.0
     present = 0
     for k in keywords:
         c = low.count(k)
         if c:
             present += 1
-            base += min(c, TF_CAP)
+            base += min(c, TF_CAP) * (1.0 + 0.15 * max(0, len(k) - 4))
     if base == 0:
-        return 0.0
+        return (0.0, 0)
 
     coverage = present ** 1.5
 
@@ -193,23 +212,53 @@ def score_file(path: Path, keywords: set[str]) -> float:
         age_days = 0.0
     freshness = 0.6 + 0.4 / (1 + age_days / 14.0)
 
-    return base * coverage * title_boost * prox_boost * freshness
+    return (base * coverage * title_boost * prox_boost * freshness, present)
 
 
-def grep_memory(mem_dir: Path, keywords: set[str], max_files: int = 3) -> list[Path]:
+def score_file(path: Path, keywords: set[str]) -> float:
+    """Relevance score for one file (0.0 if unreadable / no hit). Thin wrapper over
+    score_file_detail — kept for non-inject callers (recall, tests) so their
+    single-float contract is unchanged."""
+    return score_file_detail(path, keywords)[0]
+
+
+def grep_memory(
+    mem_dir: Path, keywords: set[str], max_files: int = 3, inject: bool = False
+) -> list[Path]:
     """Return top-K .md files by relevance, skipping transcript-noise dumps and
-    de-duplicating near-identical notes (same prose fingerprint)."""
+    de-duplicating near-identical notes (same prose fingerprint).
+
+    inject=False (default): every file with score>0 is eligible — used by recall
+    and any caller that wants best-effort matches. Behaviour unchanged.
+
+    inject=True: the strict per-turn path used by the UserPromptSubmit hook. Adds
+    a coverage gate (a file must contain ≥ min(INJECT_MIN_COVERAGE, #keywords)
+    distinct keywords) and a relevance floor (score ≥ max(MIN_SCORE_ABS,
+    MIN_SCORE_REL_FRAC × top_score)). Weak/coincidental matches return [] (silent),
+    so a vague prompt injects nothing instead of unrelated noise."""
     if not mem_dir.exists():
         return []
+    need = min(INJECT_MIN_COVERAGE, len(keywords)) if inject else 0
     results: list[tuple[float, Path]] = []
     for md in mem_dir.rglob("*.md"):
         if is_noise_file(md):  # never inject base64/JSONL garbage
             continue
-        score = score_file(md, keywords)
-        if score > 0:
-            results.append((score, md))
+        score, present = score_file_detail(md, keywords)
+        if score <= 0:
+            continue
+        if inject and present < need:  # coverage gate — kill single-keyword coincidences
+            continue
+        results.append((score, md))
+    if not results:
+        return []
     # Sort by score desc, then by mtime desc (newer wins ties)
     results.sort(key=lambda pair: (pair[0], pair[1].stat().st_mtime), reverse=True)
+    if inject:
+        top = results[0][0]
+        floor = max(MIN_SCORE_ABS, MIN_SCORE_REL_FRAC * top)
+        results = [r for r in results if r[0] >= floor]
+        if not results:
+            return []
     out: list[Path] = []
     seen: set[str] = set()
     for _, p in results:
@@ -336,6 +385,109 @@ def write_session_summary(mem_dir: Path, title: str, body: str) -> Path:
 def log_err(msg: str) -> None:
     """Write to stderr — shown to user by Claude Code if non-empty."""
     sys.stderr.write(f"[megamind] {msg}\n")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ULTRA v2: per-session inject ledger — "load once, inject deltas only"
+#
+# The UserPromptSubmit hook used to re-inject the SAME matching note on EVERY
+# turn (no memory of what it already surfaced). Once a note is in the
+# conversation it is carried forward for free in the cached prefix, so
+# re-injecting it adds zero information and — under the 5-min cache TTL and
+# bursty usage — gets re-charged at full price every time the cache goes cold.
+#
+# The ledger records, per session, the set of memory files already injected
+# (relpaths, forward-slash normalized). SessionStart pre-seeds it with what it
+# loads (index + latest resume), so the per-turn hook injects ONLY genuinely new
+# files. Stored OUTSIDE any project memory dir (CLAUDE_HOME/.megamind/seen/) so
+# it can never be picked up by grep_memory's *.md scan, recall, or vault sync.
+# Every function is fully fail-silent: any IO error or a missing session id
+# degrades to "dedup disabled" (i.e. exactly today's behaviour), never a crash.
+# ══════════════════════════════════════════════════════════════════════════
+
+def session_key(payload: dict) -> str | None:
+    """Stable per-session id from the hook payload. Prefer the explicit
+    session_id; fall back to the transcript filename stem (the session UUID) so
+    dedup still works even if the key is ever renamed. None if neither is present
+    (→ dedup silently disabled)."""
+    if not isinstance(payload, dict):
+        return None
+    sid = payload.get("session_id")
+    if not sid:
+        tp = payload.get("transcript_path")
+        if tp:
+            try:
+                sid = Path(tp).stem
+            except Exception:
+                sid = None
+    return sid or None
+
+
+def _safe_session_id(sid: str | None) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", sid or "")[:80] or "nosession"
+
+
+def _seen_dir() -> Path:
+    return CLAUDE_HOME / ".megamind" / LEDGER_DIRNAME
+
+
+def _ledger_path(session_id: str | None) -> Path:
+    return _seen_dir() / f"{_safe_session_id(session_id)}.json"
+
+
+def norm_relpath(rel) -> str:
+    """Forward-slash relpath string so SessionStart (seeding) and UserPromptSubmit
+    (checking) always agree regardless of OS separator."""
+    return str(rel).replace("\\", "/")
+
+
+def load_seen(session_id: str | None) -> set[str]:
+    """Set of relpaths already injected this session. Empty on missing id / any error."""
+    if not session_id:
+        return set()
+    try:
+        p = _ledger_path(session_id)
+        if p.exists():
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return set(data)
+    except Exception:
+        pass
+    return set()
+
+
+def save_seen(session_id: str | None, relpaths: set[str]) -> None:
+    """Atomically persist the seen-set (tmp write + os.replace). No-op on missing
+    id or any IO error — never raises, never leaves a partial file."""
+    if not session_id:
+        return
+    try:
+        d = _seen_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        p = _ledger_path(session_id)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(sorted(relpaths)), encoding="utf-8")
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
+
+def prune_old_ledgers(max_age_sec: int = LEDGER_MAX_AGE_SEC) -> None:
+    """Unlink per-session ledgers older than max_age_sec. Bounds the dir even
+    though Claude Code never signals session end. Fully fail-silent."""
+    try:
+        d = _seen_dir()
+        if not d.exists():
+            return
+        cut = time.time() - max_age_sec
+        for f in d.glob("*.json"):
+            try:
+                if f.stat().st_mtime < cut:
+                    f.unlink()
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 # ══════════════════════════════════════════════════════════════════════════

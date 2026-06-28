@@ -297,3 +297,90 @@ def test_secret_scan():
     assert lib.scan_secrets("key sk-abcdefghijklmnop12345xyz")
     assert lib.scan_secrets("-----BEGIN OPENSSH PRIVATE KEY-----")
     assert not lib.scan_secrets("no secrets here, just normal prose about code")
+
+
+# ════════════════════════════════════════════════════════════════════
+# ULTRA v2: acronym keywords + relevance floor + per-session inject ledger
+# ════════════════════════════════════════════════════════════════════
+
+def test_keywords_keep_acronyms():
+    # Short ALL-CAPS acronyms (the most salient token) must survive the length gate.
+    kw = lib.extract_keywords("what is the KDP export")
+    assert "kdp" in kw  # was previously dropped (3 chars) → root cause of weak matches
+    kw2 = lib.extract_keywords("how does the TCG OG image work")
+    assert "tcg" in kw2 and "og" in kw2
+
+
+def test_keywords_lowercase_short_words_still_dropped():
+    # The acronym pass must NOT resurrect lowercase short words.
+    kw = lib.extract_keywords("fix the cat dog")
+    assert "fix" not in kw and "cat" not in kw and "dog" not in kw
+
+
+def test_score_file_detail_returns_present_count(tmp_path):
+    p = tmp_path / "a.md"
+    p.write_text("stripe webhook stripe", encoding="utf-8")
+    score, present = lib.score_file_detail(p, {"stripe", "webhook"})
+    assert score > 0 and present == 2
+    score0, present0 = lib.score_file_detail(p, {"unrelated"})
+    assert score0 == 0.0 and present0 == 0
+
+
+def test_grep_inject_relevance_floor_rejects_weak_match(tmp_path):
+    d = tmp_path / "memory"
+    d.mkdir()
+    # A billing note shares only ONE generic word with a book-formatting query → no inject.
+    (d / "billing.md").write_text("# Billing\nstripe webhook payment flow\n", encoding="utf-8")
+    kws = lib.extract_keywords("how do I format a KDP book manuscript for kindle publishing")
+    inject = lib.grep_memory(d, kws, max_files=3, inject=True)
+    assert inject == []  # weak/irrelevant → silent (kills the wrong-note-injection class)
+
+
+def test_grep_inject_coverage_gate(tmp_path):
+    d = tmp_path / "memory"
+    d.mkdir()
+    (d / "one.md").write_text("stripe stripe stripe", encoding="utf-8")   # 1 keyword only
+    (d / "two.md").write_text("stripe webhook payment stripe", encoding="utf-8")  # 2 keywords
+    kws = {"stripe", "webhook"}
+    inject = lib.grep_memory(d, kws, max_files=5, inject=True)
+    names = [p.name for p in inject]
+    assert "two.md" in names          # clears coverage (2 distinct hits)
+    assert "one.md" not in names      # single-keyword coincidence rejected
+    # Non-inject path is unchanged: both still returned.
+    plain = [p.name for p in lib.grep_memory(d, kws, max_files=5)]
+    assert "one.md" in plain and "two.md" in plain
+
+
+def test_ledger_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setattr(lib, "CLAUDE_HOME", tmp_path / ".claude")
+    sid = "sess-abc-123"
+    assert lib.load_seen(sid) == set()          # nothing yet
+    lib.save_seen(sid, {"sessions/note.md", "MEMORY.md"})
+    assert lib.load_seen(sid) == {"sessions/note.md", "MEMORY.md"}
+    # Missing session id → always empty, never crashes.
+    assert lib.load_seen(None) == set()
+    lib.save_seen(None, {"x"})  # no-op, must not raise
+
+
+def test_ledger_prune_old(tmp_path, monkeypatch):
+    import os as _os, time as _time
+    monkeypatch.setattr(lib, "CLAUDE_HOME", tmp_path / ".claude")
+    lib.save_seen("fresh", {"a.md"})
+    lib.save_seen("stale", {"b.md"})
+    stale = lib._ledger_path("stale")
+    old = _time.time() - (lib.LEDGER_MAX_AGE_SEC + 3600)
+    _os.utime(stale, (old, old))
+    lib.prune_old_ledgers()
+    assert lib._ledger_path("fresh").exists()
+    assert not stale.exists()
+
+
+def test_session_key_prefers_id_then_transcript():
+    assert lib.session_key({"session_id": "S1"}) == "S1"
+    assert lib.session_key({"transcript_path": "/x/y/UUID-9.jsonl"}) == "UUID-9"
+    assert lib.session_key({}) is None
+
+
+def test_norm_relpath_forward_slashes():
+    assert lib.norm_relpath("sessions\\note.md") == "sessions/note.md"
+    assert lib.norm_relpath("MEMORY.md") == "MEMORY.md"

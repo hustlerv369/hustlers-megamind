@@ -14,7 +14,7 @@ turn. MegaMind is the single skill that fixes both: it remembers across sessions
 | Hook | Fires | Injects | Cost |
 |------|-------|---------|------|
 | **SessionStart** | session open / resume / clear | `MEMORY.md` index + newest **clean** `sessions/*.md` note (transcript-noise dumps are skipped) + the Lean line | ≤1500 tok once |
-| **UserPromptSubmit** | every message | top-3 keyword-matched memory files, **noise-filtered + deduped** | ≤400 tok (silent if no hit) |
+| **UserPromptSubmit** | every message | **deltas only** — keyword-matched files that pass the relevance gate (coverage + score floor) AND were not already injected this session (per-session ledger, pre-seeded by SessionStart) | ≤400 tok, **usually 0** (silent on repeat/weak hits) |
 | **PreCompact** | before auto-compaction | **nothing to context.** Writes a CLEAN structured resume (`sessions/<stamp>-resume-*.md`) — recent intent, decisions, files touched, commands, open questions — with base64 / tool-JSON stripped at write time | 0 tok |
 | **Stop** | response ends | **nothing to context.** Stamps `.last-active` + (if `MEGAMIND_AUTOSYNC=1`) a debounced, secret-scanned vault push | 0 tok |
 
