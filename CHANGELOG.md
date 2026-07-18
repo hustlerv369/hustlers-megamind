@@ -4,6 +4,49 @@ All notable changes to Megamind Ultra are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- `extract_keywords()` used an ASCII-only character class, so any
+  non-English word with a diacritic (e.g. Czech "pokračuj", "paměť")
+  was silently fragmented into unusable sub-4-char pieces and recall
+  quietly found nothing. Now Unicode-aware (`\w`).
+- `score_file_detail()` scored a keyword as a raw substring, so e.g.
+  "note" matched inside "annotate"/"notebook"/"denote", inflating both
+  the TF term and the coverage gate. Switched to word-boundary matching
+  (also fixed in the proximity-boost lookup).
+- `grep_memory()`'s sort and `latest_session_note()` called `.stat()`
+  with no error handling — a transient lock (antivirus, a concurrent
+  sync) could crash the hook outright. Both now degrade gracefully via
+  a guarded helper.
+- `write_session_summary()` stamped filenames to the minute only, so
+  two Claude Code windows on the same project (or two rapid calls in
+  the same process) could silently overwrite each other's snapshot.
+  Filenames now include seconds + PID + a short random suffix, and
+  write LF line endings explicitly instead of the OS default, so a
+  git-tracked memory vault doesn't accumulate CRLF diffs.
+- `grep_memory()` scanned every `.md` file in a project's memory dir
+  on every qualifying call with no upper bound — a new `MAX_SCAN_FILES`
+  cap (400, biased toward the most recently touched files) bounds
+  worst-case per-turn cost as a project's memory grows.
+- Nothing ever pruned `sessions/*-resume-(auto|manual).md` snapshots —
+  they accumulated forever. `hook_pre_compact.py` now calls
+  `prune_old_resume_notes()` after each write, keeping only the newest
+  30 auto-generated snapshots; hand-written session notes are never
+  matched or touched.
+- `install.py`'s `save_settings()` wrote `settings.json` directly; a
+  crash mid-write could leave it truncated. Now writes atomically
+  (temp file + `os.replace`).
+- `git_quiet()` decoded git output using the OS locale encoding, which
+  can crash or mis-decode non-ASCII memory content on Windows and
+  could make the secret scan run on garbage. Now decodes as UTF-8 with
+  `errors="replace"`.
+- `_SECRET_RE` (the vault push gate) missed Stripe's own key format
+  (`sk_live_`/`sk_test_` use an underscore, not the hyphen the old
+  pattern required) and Anthropic's own `sk-ant-...` format entirely.
+  Widened to catch both, plus GitHub fine-grained PATs and JWTs.
+- 13 new tests covering every fix above.
+
 ## [0.3.0] — 2026-06-28 — "Deltas-only"
 
 Kills the real per-turn drain: the UserPromptSubmit hook was re-injecting the

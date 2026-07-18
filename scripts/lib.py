@@ -41,6 +41,9 @@ BUDGET_SNIPPET = 600              # ~150 tokens per file
 BUDGET_INDEX_LINES = 60           # max lines of MEMORY.md to include
 MIN_KEYWORDS = 2                  # min keywords to trigger inject
 MIN_KEYWORD_LEN = 4
+MAX_SCAN_FILES = 400              # cap files scanned per grep_memory() call — bounds
+                                   # per-turn cost as a project's memory grows unbounded
+RESUME_NOTE_KEEP = 30             # cap auto-generated PreCompact resume snapshots kept
 
 # ── Ultra: token-saving constants ──
 BUDGET_PRECOMPACT = 2400          # ~600 tokens — cap for a clean resume snapshot
@@ -138,7 +141,7 @@ def extract_keywords(text: str, min_len: int = MIN_KEYWORD_LEN) -> set[str]:
     matches (a short acronym query degenerating to leftover generic words)."""
     if not text:
         return set()
-    words = re.findall(rf"[A-Za-z0-9_]{{{min_len},}}", text)
+    words = re.findall(rf"\w{{{min_len},}}", text, re.UNICODE)
     acronyms = re.findall(rf"\b[A-Z0-9]{{{ACRONYM_MIN_LEN},}}\b", text)
     # Drop common English/Czech stopwords (keeps budget clean)
     STOP = {
@@ -150,6 +153,24 @@ def extract_keywords(text: str, min_len: int = MIN_KEYWORD_LEN) -> set[str]:
     }
     out = {w.lower() for w in words} | {a.lower() for a in acronyms}
     return {w for w in out if w not in STOP}
+
+
+def _safe_mtime(path: Path) -> float:
+    """mtime, or 0.0 on any error (deleted/locked between listing and stat —
+    e.g. a concurrent sync or another session's write). Never raises, so a
+    transient FS hiccup degrades a sort order instead of crashing the hook."""
+    try:
+        return path.stat().st_mtime
+    except Exception:
+        return 0.0
+
+
+def _word_count(low: str, k: str) -> int:
+    """Word-boundary occurrence count of keyword k in already-lowercased text low.
+    Plain substring counting (the old behaviour) scored false hits inside unrelated
+    words ("note" inside "annotate"/"denote"/"notebook"), inflating both the TF
+    term and the coverage gate that decides whether a file gets auto-injected."""
+    return len(re.findall(rf"\b{re.escape(k)}\b", low))
 
 
 def score_file_detail(path: Path, keywords: set[str]) -> tuple[float, int]:
@@ -174,7 +195,7 @@ def score_file_detail(path: Path, keywords: set[str]) -> tuple[float, int]:
     base = 0.0
     present = 0
     for k in keywords:
-        c = low.count(k)
+        c = _word_count(low, k)
         if c:
             present += 1
             base += min(c, TF_CAP) * (1.0 + 0.15 * max(0, len(k) - 4))
@@ -193,7 +214,10 @@ def score_file_detail(path: Path, keywords: set[str]) -> tuple[float, int]:
     prox_boost = 1.0
     if present >= 2:
         positions = sorted(
-            (low.find(k), k) for k in keywords if low.find(k) >= 0
+            (m.start(), k)
+            for k in keywords
+            for m in [re.search(rf"\b{re.escape(k)}\b", low)]
+            if m
         )
         for i in range(len(positions)):
             window = {positions[i][1]}
@@ -239,8 +263,14 @@ def grep_memory(
     if not mem_dir.exists():
         return []
     need = min(INJECT_MIN_COVERAGE, len(keywords)) if inject else 0
+    md_files = list(mem_dir.rglob("*.md"))
+    if len(md_files) > MAX_SCAN_FILES:
+        # Bound worst-case per-turn cost as memory grows; bias toward the most
+        # recently touched files (most likely relevant) when a cap is actually hit.
+        md_files.sort(key=_safe_mtime, reverse=True)
+        md_files = md_files[:MAX_SCAN_FILES]
     results: list[tuple[float, Path]] = []
-    for md in mem_dir.rglob("*.md"):
+    for md in md_files:
         if is_noise_file(md):  # never inject base64/JSONL garbage
             continue
         score, present = score_file_detail(md, keywords)
@@ -252,7 +282,7 @@ def grep_memory(
     if not results:
         return []
     # Sort by score desc, then by mtime desc (newer wins ties)
-    results.sort(key=lambda pair: (pair[0], pair[1].stat().st_mtime), reverse=True)
+    results.sort(key=lambda pair: (pair[0], _safe_mtime(pair[1])), reverse=True)
     if inject:
         top = results[0][0]
         floor = max(MIN_SCORE_ABS, MIN_SCORE_REL_FRAC * top)
@@ -332,7 +362,7 @@ def latest_session_note(mem_dir: Path) -> Path | None:
     candidates = [p for p in sess_dir.rglob("*.md") if not is_noise_file(p)]
     if not candidates:
         return None
-    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    candidates.sort(key=_safe_mtime, reverse=True)
     return candidates[0]
 
 
@@ -372,14 +402,50 @@ def now_iso() -> str:
 
 
 def write_session_summary(mem_dir: Path, title: str, body: str) -> Path:
-    """Append a session note under memory/sessions/."""
+    """Append a session note under memory/sessions/. Filename includes seconds,
+    a PID component, and a short random suffix so two Claude Code windows on the
+    same project — or even two rapid calls in the same process/second — can never
+    collide and silently overwrite each other's snapshot (minute-only stamps used
+    to). Writes LF line endings explicitly (not the OS default) so a git-tracked
+    memory vault doesn't accumulate CRLF diffs."""
     sess_dir = mem_dir / "sessions"
     sess_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y-%m-%d-%H%M")
+    stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
     safe_title = re.sub(r"[^A-Za-z0-9._-]+", "-", title)[:40] or "session"
-    path = sess_dir / f"{stamp}-{safe_title}.md"
-    path.write_text(body, encoding="utf-8")
+    unique = f"{os.getpid() % 10000:04d}-{os.urandom(3).hex()}"
+    path = sess_dir / f"{stamp}-{unique}-{safe_title}.md"
+    path.write_text(body, encoding="utf-8", newline="\n")
     return path
+
+
+_RE_RESUME_NAME = re.compile(r"-resume-(auto|manual)\.md$")
+
+
+def prune_old_resume_notes(mem_dir: Path, keep_newest: int = RESUME_NOTE_KEEP) -> int:
+    """Cap the number of PreCompact-generated resume snapshots kept under
+    memory/sessions/ — write_session_summary() only ever appends, so without this
+    a long-lived project accumulates one file per compaction forever. Matches
+    ONLY the auto-generated `*-resume-(auto|manual).md` naming pattern; hand-written
+    session notes never match and are never touched. Fully fail-silent; returns the
+    count removed (0 on any error, including 'nothing to prune')."""
+    try:
+        sess_dir = mem_dir / "sessions"
+        if not sess_dir.exists():
+            return 0
+        notes = [p for p in sess_dir.glob("*.md") if _RE_RESUME_NAME.search(p.name)]
+        if len(notes) <= keep_newest:
+            return 0
+        notes.sort(key=_safe_mtime, reverse=True)
+        removed = 0
+        for p in notes[keep_newest:]:
+            try:
+                p.unlink()
+                removed += 1
+            except Exception:
+                pass
+        return removed
+    except Exception:
+        return 0
 
 
 def log_err(msg: str) -> None:
@@ -662,6 +728,8 @@ def build_resume(records: list[dict]) -> str:
                 decisions.append(t[:200])
 
     def tail_uniq(xs: list[str], n: int) -> list[str]:
+        if n <= 0:
+            return []
         seen: set[str] = set()
         out: list[str] = []
         for x in reversed(xs):
@@ -711,11 +779,16 @@ SYNC_DEBOUNCE_SEC = int(os.environ.get("MEGAMIND_SYNC_DEBOUNCE") or 900)
 AUTOSYNC_ON = os.environ.get("MEGAMIND_AUTOSYNC", "0") == "1"
 
 _SECRET_RE = re.compile(
-    r"(sk-[A-Za-z0-9]{16,}"
+    r"(sk-ant-[A-Za-z0-9_-]{20,}"          # Anthropic API keys (checked before generic sk-)
+    r"|sk-[A-Za-z0-9]{16,}"                 # OpenAI-style
+    r"|sk_(?:live|test)_[A-Za-z0-9]{16,}"   # Stripe secret/restricted keys
+    r"|rk_(?:live|test)_[A-Za-z0-9]{16,}"
     r"|ghp_[A-Za-z0-9]{20,}"
+    r"|github_pat_[A-Za-z0-9_]{20,}"
     r"|AKIA[0-9A-Z]{12,}"
     r"|xox[baprs]-[A-Za-z0-9-]{10,}"
     r"|AIza[0-9A-Za-z_\-]{20,}"
+    r"|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"  # JWT
     r"|-----BEGIN [A-Z ]*PRIVATE KEY-----)"
 )
 
@@ -726,10 +799,14 @@ def scan_secrets(text: str) -> bool:
 
 
 def git_quiet(args: list[str], cwd: Path, timeout: int = 10) -> tuple[int, str]:
-    """Run a git command; never raises. Returns (returncode, combined stdout+stderr)."""
+    """Run a git command; never raises. Returns (returncode, combined stdout+stderr).
+    Decodes as UTF-8 (git emits UTF-8 for diffs of UTF-8 files) with errors='replace' —
+    not the OS locale encoding, which can crash or mis-decode non-ASCII memory content
+    on Windows and could make the secret scan (which reads this diff) run on garbage."""
     try:
         p = subprocess.run(
-            ["git", *args], cwd=str(cwd), capture_output=True, text=True, timeout=timeout
+            ["git", *args], cwd=str(cwd), capture_output=True,
+            encoding="utf-8", errors="replace", timeout=timeout,
         )
         return p.returncode, (p.stdout or "") + (p.stderr or "")
     except Exception as exc:

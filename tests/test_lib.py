@@ -384,3 +384,97 @@ def test_session_key_prefers_id_then_transcript():
 def test_norm_relpath_forward_slashes():
     assert lib.norm_relpath("sessions\\note.md") == "sessions/note.md"
     assert lib.norm_relpath("MEMORY.md") == "MEMORY.md"
+
+
+# ════════════════════════════════════════════════════════════════════
+# FIXES: Unicode keyword extraction, word-boundary scoring, guarded
+# .stat(), filename collisions, resume-note pruning, bounded scan
+# ════════════════════════════════════════════════════════════════════
+
+def test_keywords_diacritics_survive():
+    # Previously the ASCII-only regex fragmented every diacritic word (e.g.
+    # "pokracuj"/"uj"), so common non-English words never became keywords.
+    kw = lib.extract_keywords("Prosím pokračuj a zkontroluj paměť před commitem")
+    assert "pokračuj" in kw
+    assert "paměť" in kw
+    assert "commitem" in kw
+
+
+def test_score_word_boundary_no_false_positive(tmp_path):
+    # "note" must not score a hit inside "annotate"/"notebook"/"denote".
+    p = tmp_path / "a.md"
+    p.write_text("Please annotate the notebook and denote the changes.", encoding="utf-8")
+    score, present = lib.score_file_detail(p, {"note"})
+    assert score == 0.0 and present == 0
+
+
+def test_score_word_boundary_real_hit_still_counts(tmp_path):
+    p = tmp_path / "a.md"
+    p.write_text("Wrote a note. Left another note for later.", encoding="utf-8")
+    score, present = lib.score_file_detail(p, {"note"})
+    assert score > 0 and present == 1
+
+
+def test_safe_mtime_missing_file_returns_zero(tmp_path):
+    ghost = tmp_path / "does-not-exist.md"
+    assert lib._safe_mtime(ghost) == 0.0
+
+
+def test_write_session_summary_no_filename_collision(tmp_path):
+    p1 = lib.write_session_summary(tmp_path, "resume-auto", "first")
+    p2 = lib.write_session_summary(tmp_path, "resume-auto", "second")
+    assert p1 != p2
+    assert p1.read_text(encoding="utf-8") == "first"
+    assert p2.read_text(encoding="utf-8") == "second"
+
+
+def test_write_session_summary_uses_lf_not_crlf(tmp_path):
+    p = lib.write_session_summary(tmp_path, "resume-manual", "line one\nline two\n")
+    assert b"\r\n" not in p.read_bytes()
+
+
+def test_prune_old_resume_notes_keeps_newest_only(tmp_path):
+    sess = tmp_path / "sessions"
+    sess.mkdir()
+    import time as _t
+
+    for i in range(5):
+        (sess / f"2026-07-{10+i:02d}-000000-0000-resume-auto.md").write_text(f"note {i}", encoding="utf-8")
+        _t.sleep(0.01)
+    removed = lib.prune_old_resume_notes(tmp_path, keep_newest=2)
+    remaining = sorted(sess.glob("*.md"))
+    assert removed == 3
+    assert len(remaining) == 2
+
+
+def test_prune_old_resume_notes_ignores_hand_written_notes(tmp_path):
+    sess = tmp_path / "sessions"
+    sess.mkdir()
+    (sess / "2026-07-01-hand-written-decision.md").write_text("important", encoding="utf-8")
+    for i in range(40):
+        (sess / f"2026-07-{i+1:02d}-resume-auto.md").write_text("x", encoding="utf-8")
+    lib.prune_old_resume_notes(tmp_path, keep_newest=5)
+    assert (sess / "2026-07-01-hand-written-decision.md").exists()
+    assert len(list(sess.glob("*resume-auto.md"))) == 5
+
+
+def test_secret_scan_widened_patterns():
+    assert lib.scan_secrets("STRIPE_KEY=sk_live_abcdefghijklmnop1234")
+    assert lib.scan_secrets("ANTHROPIC_API_KEY=sk-ant-api03-abcdefghijklmnopqrstuvwx")
+    assert lib.scan_secrets("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dQw4w9WgXcQ")
+    assert not lib.scan_secrets("no secrets here, just normal prose about code")
+
+
+def test_grep_memory_respects_max_scan_files_cap(tmp_path, monkeypatch):
+    d = tmp_path / "memory"
+    d.mkdir()
+    import time as _t
+
+    old = d / "old.md"
+    old.write_text("relevant content here", encoding="utf-8")
+    _t.sleep(0.02)
+    for i in range(4):
+        (d / f"filler{i}.md").write_text("irrelevant filler text", encoding="utf-8")
+    monkeypatch.setattr(lib, "MAX_SCAN_FILES", 2)
+    results = lib.grep_memory(d, {"relevant", "content"}, max_files=5)
+    assert old not in results

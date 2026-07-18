@@ -23,6 +23,7 @@ from lib import (
     iter_transcript_blocks,
     log_err,
     now_iso,
+    prune_old_resume_notes,
     read_hook_input,
     write_session_summary,
 )
@@ -60,6 +61,7 @@ def main() -> None:
             ]
         )
         write_session_summary(mem, f"resume-{trigger}", body)
+        prune_old_resume_notes(mem)
     except Exception as exc:
         # Only truly unexpected failures get logged; the expected
         # empty/absent-transcript path is silent to keep PreCompact at 0 tokens.

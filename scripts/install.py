@@ -56,7 +56,11 @@ def save_settings(data: dict) -> None:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         backup = SETTINGS.with_suffix(f".json.bak-{stamp}")
         shutil.copy2(SETTINGS, backup)
-    SETTINGS.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    # Atomic write (tmp + os.replace) — a crash mid-write can never leave
+    # settings.json (which gates every hook/permission/MCP server) truncated.
+    tmp = SETTINGS.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, SETTINGS)
 
 
 def build_hook_entry(script_path: Path) -> dict:
