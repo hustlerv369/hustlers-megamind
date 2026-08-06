@@ -8,8 +8,12 @@ Usage:
   python cli.py list                 # list all memory files
   python cli.py lean status|on|off|apply|restore
                                      # token-discipline: view/flip settings (reversible)
+  python cli.py caveman status|on|off|lite|full|ultra|wenyan-*|never|always
+                                     # OUTPUT-token compression: terse caveman replies
   python cli.py vault sync|mirror|prune [--force]
                                      # mirror project memory to the memory-vault repo
+  python cli.py reconcile            # memory governance report: duplicates,
+                                     # orphans (not in MEMORY.md), stale, superseded
   python cli.py skills audit|disable --unused|enable <name>|restore|list
                                      # lazy-load: disable unused skills so their
                                      # descriptions stop loading (~19k tok/session)
@@ -24,14 +28,22 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from lib import (
+    CAVEMAN_DEFAULT_MODE,
+    CAVEMAN_FLAG,
+    CAVEMAN_MODES,
+    CAVEMAN_OFF_FLAG,
     CLAUDE_HOME,
+    caveman_active_mode,
+    caveman_globally_off,
     extract_keywords,
     extract_snippet,
     find_memory_dir,
     grep_memory,
     lean_on,
     memory_index,
+    normalize_caveman_mode,
     project_slug_from_cwd,
+    write_caveman_flag,
 )
 
 
@@ -187,6 +199,117 @@ def cmd_vault(args: list[str]) -> int:
     return 1
 
 
+def cmd_reconcile() -> int:
+    """Memory governance (deterministic, žádný LLM): najdi duplicity, sirotky mimo
+    index, stale kandidáty a superseded poznámky. NIC nemaže — report pro
+    rozhodnutí (Claude/uživatel označí `superseded_by:` ve frontmatter)."""
+    import time as _time
+
+    from lib import _prose_fingerprint, is_noise_file, is_superseded
+
+    cwd = os.getcwd()
+    mem = find_memory_dir(cwd)
+    if not mem:
+        print(f"No memory dir for {cwd}", file=sys.stderr)
+        return 1
+    notes = [p for p in mem.rglob("*.md") if p.name != "MEMORY.md" and not is_noise_file(p)]
+    idx_text = ""
+    try:
+        idx_text = (mem / "MEMORY.md").read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        pass
+
+    superseded = [p for p in notes if is_superseded(p)]
+    live = [p for p in notes if p not in superseded]
+
+    # 1) duplicity podle prose fingerprintu (stejné první 3 řádky prózy)
+    groups: dict[str, list] = {}
+    for p in live:
+        fp = _prose_fingerprint(p)
+        if fp:
+            groups.setdefault(fp, []).append(p)
+    dupes = {fp: ps for fp, ps in groups.items() if len(ps) > 1}
+
+    # 2) sirotci: top-level poznámky (mimo sessions/), na které index neodkazuje
+    orphans = [
+        p for p in live
+        if p.parent == mem and p.name not in idx_text
+    ]
+
+    # 3) stale kandidáti: >90 dní nedotčené top-level poznámky
+    cut = _time.time() - 90 * 86400
+    stale = [p for p in live if p.parent == mem and p.stat().st_mtime < cut]
+
+    print(f"Memory reconcile — {mem}")
+    print(f"  poznámek: {len(notes)} (live {len(live)}, superseded {len(superseded)})")
+    if dupes:
+        print(f"\n⚠️ DUPLICITY ({len(dupes)} skupin) — slouč / označ superseded_by:")
+        for ps in dupes.values():
+            print("   • " + "  ×  ".join(str(x.relative_to(mem)) for x in ps))
+    if orphans:
+        print(f"\n⚠️ SIROTCI mimo MEMORY.md index ({len(orphans)}) — přidej řádek do indexu, nebo smaž:")
+        for p in orphans:
+            print(f"   • {p.name}")
+    if stale:
+        print(f"\nℹ️ STALE >90 dní ({len(stale)}) — zvaž superseded_by / aktualizaci:")
+        for p in stale:
+            age = int((_time.time() - p.stat().st_mtime) / 86400)
+            print(f"   • {p.name}  ({age} dní)")
+    if superseded:
+        print(f"\n📁 superseded (archiv, z recall vyfiltrováno): "
+              + ", ".join(p.name for p in superseded))
+    if not (dupes or orphans or stale):
+        print("\n✅ čisto — žádné duplicity, sirotci ani stale kandidáti.")
+    print("\nJak uzavřít fakt: do frontmatter přidej `superseded_by: <name-nové-poznámky>`"
+          "\n— zůstane na disku (audit), ale recall/inject ho už nikdy nevytáhne.")
+    return 0
+
+
+def cmd_caveman(args: list[str]) -> int:
+    action = (args[0] if args else "status").lower()
+
+    if action == "status":
+        if caveman_globally_off():
+            print("caveman:   DISABLED globally (megamind-caveman.off present)")
+            print("           re-enable → python cli.py caveman always")
+            return 0
+        mode = caveman_active_mode()
+        print(f"caveman:   {'ON — level ' + mode if mode else 'off (this session only)'}")
+        print(f"default:   {CAVEMAN_DEFAULT_MODE}  (always-on; 'off' never persists across sessions)")
+        print(f"levels:    {', '.join(CAVEMAN_MODES)}")
+        print(f"flag:      {CAVEMAN_FLAG}")
+        return 0
+
+    if action == "never":      # permanent global kill switch
+        try:
+            CAVEMAN_OFF_FLAG.write_text("", encoding="utf-8")
+        except Exception as exc:
+            print(f"cannot write kill switch: {exc}", file=sys.stderr)
+            return 1
+        print("caveman DISABLED globally (created megamind-caveman.off). Affects NEW sessions.")
+        return 0
+
+    if action == "always":     # remove kill switch + re-arm default
+        if CAVEMAN_OFF_FLAG.exists():
+            CAVEMAN_OFF_FLAG.unlink()
+        write_caveman_flag(CAVEMAN_DEFAULT_MODE)
+        print(f"caveman always-on re-enabled (default {CAVEMAN_DEFAULT_MODE}).")
+        return 0
+
+    norm = normalize_caveman_mode(action)
+    if norm == "off":
+        write_caveman_flag("off")
+        print("caveman off for THIS session (always-on re-arms next session; `never` = permanent).")
+        return 0
+    if norm:
+        write_caveman_flag(norm)
+        print(f"caveman level → {norm} (applies to your next message / new sessions).")
+        return 0
+
+    print("usage: caveman status|on|off|lite|full|ultra|wenyan-lite|wenyan-full|wenyan-ultra|never|always")
+    return 1
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
         print(__doc__.strip())
@@ -200,8 +323,12 @@ def main(argv: list[str]) -> int:
         return cmd_list()
     if cmd == "lean":
         return cmd_lean(argv[2:])
+    if cmd == "caveman":
+        return cmd_caveman(argv[2:])
     if cmd == "vault":
         return cmd_vault(argv[2:])
+    if cmd == "reconcile":
+        return cmd_reconcile()
     if cmd == "skills":
         import skills
         return skills.main(["skills"] + argv[2:])

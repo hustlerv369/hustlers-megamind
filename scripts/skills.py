@@ -38,24 +38,13 @@ SKILLS_DIR = CLAUDE_HOME / "skills"
 # like 142 deletions.
 DISABLED_DIR = SKILLS_DIR.resolve().parent / "skills-disabled"
 
-# megamind itself must NEVER be disabled (its hooks would break). Everything else
-# is opt-in via ~/.claude/megamind-keep.txt (one skill name per line, '#' comments).
-# _settings_referenced() already auto-protects any skill wired into settings.json.
-KEEP_FILE = CLAUDE_HOME / "megamind-keep.txt"
-
-
-def _user_keep() -> set[str]:
-    try:
-        return {
-            ln.strip()
-            for ln in KEEP_FILE.read_text(encoding="utf-8").splitlines()
-            if ln.strip() and not ln.lstrip().startswith("#")
-        }
-    except Exception:
-        return set()
-
-
-PROTECT = {"megamind"} | _user_keep()
+# Never disable: core daily-drivers + things referenced elsewhere.
+PROTECT = {
+    "megamind", "session-startup", "headroom-status", "secret-input", "secret",
+    "sync", "wip", "orchestrate", "gen-image",
+    "hustlers-web-design", "impeccable", "scroll-stop-prompter",
+    "claude-code-mastery", "claude-code-router",
+}
 
 SCAN_FILE_CAP = 300          # most-recent transcripts to scan for usage
 RECENT_WINDOW_DAYS = 120     # ignore transcripts older than this for the usage signal

@@ -3,7 +3,7 @@
 MegaMind vault sync — mirror project memory into the memory-vault git repo.
 
 SAFETY: vault.sync() runs git DIRECTLY (it does not go through Claude's Bash
-tool), so it bypasses the pre-commit-secrets.sh hook. Your memory-vault repo may be public,
+tool), so it bypasses the pre-commit-secrets.sh hook. The vault repo is public,
 and hand-written notes can contain keys/PII. Therefore:
   • Auto-sync is OFF unless MEGAMIND_AUTOSYNC=1 (or --force on the CLI).
   • Every push is debounced (≥15 min) and every git call is timeboxed.
@@ -16,10 +16,12 @@ Zero external deps (stdlib + git CLI). Usage:
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -91,6 +93,44 @@ def _touch_stamp() -> None:
         pass
 
 
+_LOCK_STALE_SEC = 180
+
+
+@contextlib.contextmanager
+def _sync_lock(timeout: int = 30):
+    """Cross-process mutex over the vault git tree. Parallel workers + the Stop
+    hook can all call sync() at once and race the same git index → corruption /
+    merge conflicts. Atomic O_EXCL lockfile with stale-lock takeover. Raises
+    TimeoutError if another holder keeps the lock past `timeout`."""
+    lock = VAULT_DIR / ".megamind-sync.lock"
+    fd = None
+    deadline = time.time() + timeout
+    while True:
+        try:
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, f"{os.getpid()} {now_iso()}".encode("utf-8"))
+            break
+        except FileExistsError:
+            try:  # steal a stale lock (dead/crashed holder)
+                if time.time() - lock.stat().st_mtime > _LOCK_STALE_SEC:
+                    lock.unlink()
+                    continue
+            except Exception:
+                pass
+            if time.time() > deadline:
+                raise TimeoutError("vault sync lock busy")
+            time.sleep(0.5)
+    try:
+        yield
+    finally:
+        try:
+            if fd is not None:
+                os.close(fd)
+            lock.unlink()
+        except Exception:
+            pass
+
+
 def sync(slug: str, force: bool = False) -> str:
     """Mirror + commit + push, gated by AUTOSYNC + debounce + secret scan."""
     if not (AUTOSYNC_ON or force):
@@ -100,42 +140,50 @@ def sync(slug: str, force: bool = False) -> str:
     if not force and _debounced():
         return "skip: debounced"
 
-    mirror_project_memory(slug)
-    git_quiet(["add", "-A"], VAULT_DIR, timeout=15)
+    try:
+        with _sync_lock():
+            mirror_project_memory(slug)
+            git_quiet(["add", "-A"], VAULT_DIR, timeout=15)
 
-    rc, _ = git_quiet(["diff", "--cached", "--quiet"], VAULT_DIR, timeout=10)
-    if rc == 0:
-        _touch_stamp()
-        return "nothing to sync"
+            rc, _ = git_quiet(["diff", "--cached", "--quiet"], VAULT_DIR, timeout=10)
+            if rc == 0:
+                _touch_stamp()
+                return "nothing to sync"
 
-    # Secret gate over the staged diff (git path bypasses the Bash pre-commit hook).
-    _, diff = git_quiet(["diff", "--cached"], VAULT_DIR, timeout=10)
-    if scan_secrets(diff):
-        git_quiet(["reset"], VAULT_DIR, timeout=10)
-        log_err("vault sync ABORTED: a secret-looking token was found in the staged diff.")
-        return "ABORT: secret detected in staged memory — not committed"
+            # Secret gate over the staged diff (git path bypasses the Bash pre-commit hook).
+            _, diff = git_quiet(["diff", "--cached"], VAULT_DIR, timeout=10)
+            if scan_secrets(diff):
+                git_quiet(["reset"], VAULT_DIR, timeout=10)
+                log_err("vault sync ABORTED: a secret-looking token was found in the staged diff.")
+                return "ABORT: secret detected in staged memory — not committed"
 
-    git_quiet(["commit", "-m", f"[megamind] auto-sync {slug} {now_iso()}"], VAULT_DIR, timeout=10)
-    prc, pout = git_quiet(["push"], VAULT_DIR, timeout=20)
-    _touch_stamp()
-    return "synced + pushed" if prc == 0 else f"committed; push failed: {pout.strip()[:120]}"
+            git_quiet(["commit", "-m", f"[megamind] auto-sync {slug} {now_iso()}"], VAULT_DIR, timeout=10)
+            prc, pout = git_quiet(["push"], VAULT_DIR, timeout=20)
+            _touch_stamp()
+            return "synced + pushed" if prc == 0 else f"committed; push failed: {pout.strip()[:120]}"
+    except TimeoutError:
+        return "skip: another vault sync in progress (lock busy)"
 
 
 def prune() -> str:
     """Remove transcript-noise dumps from the vault index + disk AND local projects."""
     pat = re.compile(r"compact-(auto|manual)")
     removed = 0
-    # Vault working tree
+    # Vault working tree (under the same lock as sync — both touch the git index)
     if VAULT_DIR.exists():
-        for md in VAULT_DIR.rglob("*.md"):
-            if md.name.startswith("_compact-") or pat.search(md.name):
-                git_quiet(["rm", "--cached", "--ignore-unmatch", str(md)], VAULT_DIR, timeout=10)
-                try:
-                    md.unlink()
-                    removed += 1
-                except Exception:
-                    pass
-        git_quiet(["commit", "-m", "[megamind] prune transcript noise"], VAULT_DIR, timeout=10)
+        try:
+            with _sync_lock():
+                for md in VAULT_DIR.rglob("*.md"):
+                    if md.name.startswith("_compact-") or pat.search(md.name):
+                        git_quiet(["rm", "--cached", "--ignore-unmatch", str(md)], VAULT_DIR, timeout=10)
+                        try:
+                            md.unlink()
+                            removed += 1
+                        except Exception:
+                            pass
+                git_quiet(["commit", "-m", "[megamind] prune transcript noise"], VAULT_DIR, timeout=10)
+        except TimeoutError:
+            log_err("vault prune skipped: sync lock busy")
     # Local project memory copies
     if PROJECTS_ROOT.exists():
         for md in PROJECTS_ROOT.rglob("*.md"):

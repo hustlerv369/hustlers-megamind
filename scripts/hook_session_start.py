@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from lib import (
     BUDGET_SESSION_START,
     LEAN_LINE,
+    caveman_session_block,
     find_memory_dir,
     format_budget,
     latest_session_note,
@@ -35,6 +36,7 @@ from lib import (
 def main() -> None:
     payload = read_hook_input()
     cwd = payload.get("cwd")
+    sid = session_key(payload)
     mem = find_memory_dir(cwd)
     if not mem:
         # Silent — project has no memory yet, nothing to inject.
@@ -68,7 +70,12 @@ def main() -> None:
     if lean_on():
         parts.append("## ⚡ Lean mode\n" + LEAN_LINE)
 
-    if not parts:
+    # Caveman ruleset (output-token compression). Built separately so it lives in its
+    # OWN slot — memory budget pressure can never clip it, and it never pushes memory
+    # out. '' when the permanent kill switch (megamind-caveman.off) is set.
+    caveman_block = caveman_session_block(sid)
+
+    if not parts and not caveman_block:
         return
 
     # Pre-seed the per-session inject ledger with what we load HERE (index + latest
@@ -77,7 +84,6 @@ def main() -> None:
     # prefix. Disk-only (0 tokens added to the payload), fully fail-silent.
     try:
         prune_old_ledgers()
-        sid = session_key(payload)
         if sid:
             seed: set[str] = set()
             if idx:
@@ -89,20 +95,26 @@ def main() -> None:
     except Exception:
         pass
 
-    # Preamble gives Claude clear instructions on how to use this context.
-    preamble = (
-        "The following context is auto-loaded from persistent project memory "
-        "(~/.claude/projects/*/memory/). Treat it as background — you already "
-        "know these facts. Do NOT re-summarize it to the user unless asked. "
-        "If anything here contradicts what the user is saying now, the live "
-        "conversation wins, but mention the discrepancy."
-    )
-    body = "\n\n---\n\n".join(parts)
-    full = f"{preamble}\n\n---\n\n{body}"
-    full = format_budget(full, BUDGET_SESSION_START)
+    # Assemble: caveman ruleset first (its own slot), then the budgeted memory body.
+    out_chunks: list[str] = []
+    if caveman_block:
+        out_chunks.append(caveman_block)
+
+    if parts:
+        # Preamble gives Claude clear instructions on how to use this context.
+        preamble = (
+            "The following context is auto-loaded from persistent project memory "
+            "(~/.claude/projects/*/memory/). Treat it as background — you already "
+            "know these facts. Do NOT re-summarize it to the user unless asked. "
+            "If anything here contradicts what the user is saying now, the live "
+            "conversation wins, but mention the discrepancy."
+        )
+        body = "\n\n---\n\n".join(parts)
+        full = f"{preamble}\n\n---\n\n{body}"
+        out_chunks.append(format_budget(full, BUDGET_SESSION_START))
 
     # stdout = additionalContext for SessionStart / UserPromptSubmit hooks
-    sys.stdout.write(full)
+    sys.stdout.write("\n\n---\n\n".join(out_chunks))
 
 
 if __name__ == "__main__":

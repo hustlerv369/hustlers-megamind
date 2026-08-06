@@ -89,23 +89,19 @@ def project_slug_from_cwd(cwd: str | None) -> str | None:
     """
     Claude Code stores per-project data under ~/.claude/projects/<slug>/.
     The slug is the full cwd with every `:`, `/`, `\\`, `.`, AND whitespace
-    mapped to `-`. The whitespace mapping is essential: a path like
-    "D:\\CLAUDE\\My App" becomes "D--CLAUDE-My-App" (matching Claude Code's own
-    slug) — without it the space survived and the memory lookup silently fell
-    back to the PARENT project's memory.
-
-    The leading dash is NOT stripped. On Unix an absolute path starts with `/`,
-    so the slug legitimately starts with `-` (/Users/ann/app → -Users-ann-app),
-    exactly as Claude Code names the directory. Stripping it made every lookup
-    on macOS/Linux miss, and the hooks then exited silently. Windows paths start
-    with a drive letter, so they are unaffected either way. Examples:
-        D:\\CLAUDE\\my-project                 → D--CLAUDE-my-project
-        D:\\CLAUDE\\My App                     → D--CLAUDE-My-App
-        /Users/ann/my-project                 → -Users-ann-my-project
-        /home/ann/my project                  → -home-ann-my-project
+    mapped to `-`, then leading dashes stripped. The whitespace mapping is
+    essential: a path like "D:\\CLAUDE\\CLAUDE OS" becomes "D--CLAUDE-CLAUDE-OS"
+    (matching Claude Code's own slug) — without it the space survived and the
+    memory lookup silently fell back to the PARENT project's memory. Examples:
+        D:\\CLAUDE\\seokrates-web                 → D--CLAUDE-seokrates-web
+        D:\\CLAUDE\\CLAUDE OS                     → D--CLAUDE-CLAUDE-OS
+        D:\\CLAUDE\\seokrates-web\\.claude\\w\\x  → D--CLAUDE-seokrates-web--claude-w-x
     """
     if not cwd:
         return None
+    # The leading dash is part of the slug on Unix: Claude Code maps an absolute
+    # path's leading `/` to `-` (/Users/ann/app → -Users-ann-app). Stripping it
+    # made every macOS/Linux lookup miss and the hooks exit silently.
     return re.sub(r"[:\\/.\s]", "-", cwd)
 
 
@@ -118,7 +114,7 @@ def find_memory_dir(cwd: str | None) -> Path | None:
     if mem.exists() and mem.is_dir():
         return mem
     # Fallback 1: worktrees share memory with their parent repo
-    # e.g. D--CLAUDE-my-project--claude-worktrees-lucid-brattain → parent
+    # e.g. D--CLAUDE-seokrates-web--claude-worktrees-lucid-brattain → parent
     parts = slug.split("--claude-worktrees-")
     if len(parts) == 2:
         parent_slug = parts[0]
@@ -163,8 +159,8 @@ def extract_keywords(text: str, min_len: int = MIN_KEYWORD_LEN) -> set[str]:
 
 def _safe_mtime(path: Path) -> float:
     """mtime, or 0.0 on any error (deleted/locked between listing and stat —
-    e.g. a concurrent sync or another session's write). Never raises, so a
-    transient FS hiccup degrades a sort order instead of crashing the hook."""
+    e.g. a concurrent OneDrive sync or another session's write). Never raises,
+    so a transient FS hiccup degrades a sort order instead of crashing the hook."""
     try:
         return path.stat().st_mtime
     except Exception:
@@ -278,6 +274,8 @@ def grep_memory(
     results: list[tuple[float, Path]] = []
     for md in md_files:
         if is_noise_file(md):  # never inject base64/JSONL garbage
+            continue
+        if is_superseded(md):  # closed facts stay auditable but never resurface
             continue
         score, present = score_file_detail(md, keywords)
         if score <= 0:
@@ -412,8 +410,8 @@ def write_session_summary(mem_dir: Path, title: str, body: str) -> Path:
     a PID component, and a short random suffix so two Claude Code windows on the
     same project — or even two rapid calls in the same process/second — can never
     collide and silently overwrite each other's snapshot (minute-only stamps used
-    to). Writes LF line endings explicitly (not the OS default) so a git-tracked
-    memory vault doesn't accumulate CRLF diffs."""
+    to). Writes LF line endings explicitly (not the OS default) so the git-tracked
+    memory-vault mirror doesn't accumulate CRLF diffs."""
     sess_dir = mem_dir / "sessions"
     sess_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
@@ -552,12 +550,13 @@ def prune_old_ledgers(max_age_sec: int = LEDGER_MAX_AGE_SEC) -> None:
         if not d.exists():
             return
         cut = time.time() - max_age_sec
-        for f in d.glob("*.json"):
-            try:
-                if f.stat().st_mtime < cut:
-                    f.unlink()
-            except Exception:
-                pass
+        for pattern in ("*.json", "*.flag"):
+            for f in d.glob(pattern):
+                try:
+                    if f.stat().st_mtime < cut:
+                        f.unlink()
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -594,6 +593,21 @@ def is_noise_file(path: Path) -> bool:
         return False
     noisy = sum(1 for ln in lines if is_noise_line(ln))
     return noisy >= NOISE_MIN_NOISY_LINES and (noisy / len(lines)) >= NOISE_LINE_RATIO
+
+
+_RE_SUPERSEDED = re.compile(r"^superseded_by:\s*\S", re.M)
+
+
+def is_superseded(path: Path) -> bool:
+    """Temporal governance: a note whose frontmatter carries a non-empty
+    `superseded_by:` is a CLOSED fact — kept on disk for audit, but never
+    recalled/injected again (stale advice must not resurface as live)."""
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            head = f.read(600)
+    except Exception:
+        return False
+    return head.lstrip().startswith("---") and bool(_RE_SUPERSEDED.search(head))
 
 
 def _prose_fingerprint(path: Path) -> str:
@@ -776,12 +790,186 @@ def lean_on() -> bool:
     return not (CLAUDE_HOME / "megamind-lean.off").exists()
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# ULTRA: caveman mode (OUTPUT-token compression, folded-in caveman skill)
+# ══════════════════════════════════════════════════════════════════════════
+# Lean trims the INPUT side (context/memory). Caveman trims the OUTPUT side:
+# the model answers in terse "smart-caveman" prose — drops articles/filler/
+# pleasantries/hedging, keeps every bit of technical substance — for ~65-75%
+# fewer output tokens. Folded into MegaMind's existing SessionStart +
+# UserPromptSubmit hooks so it adds NO new hooks (caveman's standalone install
+# would double-hook the same two events MegaMind already owns). Source skill:
+# github.com/JuliusBrussee/caveman.
+
+CAVEMAN_FLAG = CLAUDE_HOME / ".caveman-active"        # legacy global fallback (no session id)
+CAVEMAN_OFF_FLAG = CLAUDE_HOME / "megamind-caveman.off"  # permanent global kill switch
+CAVEMAN_DEFAULT_MODE = (os.environ.get("CAVEMAN_DEFAULT_MODE") or "lite").strip().lower() or "lite"
+CAVEMAN_MODES = ("lite", "full", "ultra", "wenyan-lite", "wenyan-full", "wenyan-ultra")
+_CAVEMAN_OFF_WORDS = ("off", "stop", "disable", "none", "normal", "vypni")
+
+# Natural-language activation / deactivation (EN + CZ). Conservative on ON (it is
+# already always-on by default) so we mostly catch level switches + OFF.
+_CAVEMAN_ON_NL = re.compile(
+    r"\b(caveman mode|talk like (?:a )?caveman|mluv jako caveman|use caveman|"
+    r"activate caveman|turn on caveman|zapni caveman)\b",
+    re.I,
+)
+_CAVEMAN_OFF_NL = re.compile(
+    r"\b(stop caveman|disable caveman|deactivate caveman|vypni caveman|"
+    r"přestaň caveman|normal mode|normální režim)\b",
+    re.I,
+)
+# /caveman, /caveman ultra, /caveman wenyan-full, /caveman off ...
+_CAVEMAN_SLASH = re.compile(r"^/caveman(?:\s+([A-Za-z-]+))?\s*$", re.I)
+
+# The ruleset injected once per session (cache-stable SessionStart prefix). {level}
+# is the active intensity. Commit + review behaviour folded in (caveman-commit /
+# caveman-review skills) so they need no separate skill files.
+CAVEMAN_RULESET = """## ⛏ Caveman mode — ACTIVE (level: {level})
+Respond terse like a smart caveman. Keep ALL technical substance; cut only fluff. \
+Active every response until the user says "stop caveman" / "normal mode".
+
+Drop: filler (just/really/basically/actually/simply), pleasantries (sure/certainly/\
+happy to/of course), hedging. At full+ also drop articles (a/an/the); fragments OK; \
+short synonyms ("fix" not "implement a solution for"). No tool-call narration, no \
+decorative tables/emoji, no dumping long raw error logs — quote the shortest decisive \
+line. Keep VERBATIM: code, function/API names, CLI commands, exact error strings, \
+commit-type keywords (feat/fix/...). Preserve the user's language (Czech in → Czech \
+caveman). Never announce or name the mode.
+
+Levels — **lite**: drop filler/hedging, KEEP articles + full sentences (professional, \
+tight). **full**: drop articles, fragments OK, short synonyms. **ultra**: also abbreviate \
+PROSE words (DB/auth/cfg/fn/impl), arrows for causality (X → Y), one word where one word \
+does — never abbreviate real code symbols. **wenyan-***: classical Chinese 文言文 register.
+
+Auto-clarity — drop caveman to NORMAL prose for: security warnings, irreversible / \
+destructive-action confirmations, multi-step sequences where fragment order risks a \
+misread, or when the user is confused / repeats a question. Resume caveman after.
+
+Commits (when writing one): Conventional Commits, imperative subject ≤50 chars, body \
+only for a non-obvious *why* / breaking change / migration. No "this commit does", no AI \
+attribution unless the user's own rule requires a trailer.
+Reviews (when reviewing code): one line per finding — `path:Lnn: <emoji> <sev>: problem. \
+fix.` (🔴 bug / 🟡 risk / 🔵 nit / ❓ q). No praise, no restating the diff. Security \
+findings → plain-English risk first.
+
+Write NORMAL prose inside code blocks, commit bodies, and PR descriptions; compress only \
+the prose around them."""
+
+
+def caveman_globally_off() -> bool:
+    """Permanent kill switch: ~/.claude/megamind-caveman.off disables caveman entirely."""
+    return CAVEMAN_OFF_FLAG.exists()
+
+
+def _caveman_flag_path(session_id: str | None) -> Path:
+    """Per-session caveman flag, stored alongside the inject-seen ledger
+    (CLAUDE_HOME/.megamind/seen/) so it's pruned by the same prune_old_ledgers().
+    Keying by session_id stops one project's "stop caveman" from silently bleeding
+    into every OTHER concurrently-open Claude Code session on the machine — the
+    old single global file was shared by every project at once. Falls back to the
+    legacy global path only if no session id is available (defensive; Claude Code
+    always sends one)."""
+    if session_id:
+        return _seen_dir() / f"caveman-{_safe_session_id(session_id)}.flag"
+    return CAVEMAN_FLAG
+
+
+def read_caveman_flag(session_id: str | None = None) -> str | None:
+    """Raw flag content (a level, an off-word, or None if absent/unreadable)."""
+    try:
+        v = _caveman_flag_path(session_id).read_text(encoding="utf-8").strip().lower()
+    except Exception:
+        return None
+    return v or None
+
+
+def write_caveman_flag(mode: str, session_id: str | None = None) -> None:
+    """Persist the active level atomically (tmp write + os.replace) — fail-silent,
+    a hook must never crash on FS error."""
+    try:
+        p = _caveman_flag_path(session_id)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text((mode or "").strip().lower(), encoding="utf-8")
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
+
+def normalize_caveman_mode(raw: str) -> str | None:
+    """Map a user token → canonical level / 'off' / None (unknown)."""
+    t = (raw or "").strip().lower()
+    if t in _CAVEMAN_OFF_WORDS:
+        return "off"
+    if t in ("", "on", "default"):
+        return CAVEMAN_DEFAULT_MODE
+    if t == "wenyan":
+        return "wenyan-full"
+    if t in CAVEMAN_MODES:
+        return t
+    return None
+
+
+def caveman_active_mode(session_id: str | None = None) -> str | None:
+    """Current active level, or None if disabled (globally-off, or session 'off')."""
+    if caveman_globally_off():
+        return None
+    v = read_caveman_flag(session_id)
+    if v in _CAVEMAN_OFF_WORDS:
+        return None
+    return v if v in CAVEMAN_MODES else None
+
+
+def caveman_session_block(session_id: str | None = None) -> str:
+    """SessionStart: establish always-on default + return the ruleset to inject.
+
+    Always-on semantics: an explicit level persists across sessions, but a prior
+    "stop caveman" (off) NEVER persists — each session re-establishes the default.
+    Returns '' only when the permanent kill switch is set.
+    """
+    if caveman_globally_off():
+        return ""
+    mode = read_caveman_flag(session_id)
+    if mode not in CAVEMAN_MODES:        # absent, garbage, or an off-word → reset
+        mode = CAVEMAN_DEFAULT_MODE
+        write_caveman_flag(mode, session_id)
+    return CAVEMAN_RULESET.format(level=mode)
+
+
+def caveman_handle_prompt(prompt: str, session_id: str | None = None) -> str:
+    """UserPromptSubmit: parse /caveman + NL activation, update the flag, and return
+    the tiny per-turn reinforcement anchor when caveman is active (else '')."""
+    if caveman_globally_off():
+        return ""
+    text = (prompt or "").strip()
+    m = _CAVEMAN_SLASH.match(text)
+    if m:
+        norm = normalize_caveman_mode(m.group(1) or "")
+        if norm:
+            write_caveman_flag(norm, session_id)
+    elif _CAVEMAN_OFF_NL.search(text):
+        write_caveman_flag("off", session_id)
+    elif _CAVEMAN_ON_NL.search(text):
+        write_caveman_flag(CAVEMAN_DEFAULT_MODE, session_id)
+
+    mode = caveman_active_mode(session_id)
+    if not mode:
+        return ""
+    # Attention anchor — keeps caveman style alive after other plugins inject
+    # competing instructions mid-conversation. The full ruleset (incl. the
+    # security/destructive-action carve-out) stays in the cache-stable SessionStart
+    # prefix; this is just a cheap per-turn reminder, shrunk from ~29 to ~14 tok
+    # since the full rule text doesn't need repeating every turn.
+    return f"[caveman:{mode}; normal prose for security/destructive]"
+
+
 VAULT_DIR = Path(
     os.environ.get("MEGAMIND_VAULT_DIR") or (Path.home() / "Documents" / "GitHub" / "memory-vault")
 )
 SYNC_DEBOUNCE_SEC = int(os.environ.get("MEGAMIND_SYNC_DEBOUNCE") or 900)
 # Default OFF: vault.sync() calls git directly (bypassing Claude's pre-commit secret
-# hook) and your memory-vault repo may be public — opt in only after accepting the inline scan.
+# hook) and the vault repo is public — opt in only after accepting the inline scan.
 AUTOSYNC_ON = os.environ.get("MEGAMIND_AUTOSYNC", "0") == "1"
 
 _SECRET_RE = re.compile(
@@ -807,8 +995,9 @@ def scan_secrets(text: str) -> bool:
 def git_quiet(args: list[str], cwd: Path, timeout: int = 10) -> tuple[int, str]:
     """Run a git command; never raises. Returns (returncode, combined stdout+stderr).
     Decodes as UTF-8 (git emits UTF-8 for diffs of UTF-8 files) with errors='replace' —
-    not the OS locale encoding, which can crash or mis-decode non-ASCII memory content
-    on Windows and could make the secret scan (which reads this diff) run on garbage."""
+    NOT the Windows locale (cp1252), which crashed on Czech/emoji memory content and could
+    make the secret-scan (which reads this diff) run on garbage / bypass. errors='replace'
+    keeps secret patterns intact (they're ASCII) while never raising on odd bytes."""
     try:
         p = subprocess.run(
             ["git", *args], cwd=str(cwd), capture_output=True,

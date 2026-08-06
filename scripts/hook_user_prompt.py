@@ -27,6 +27,7 @@ from lib import (
     BUDGET_SNIPPET,
     BUDGET_USER_PROMPT,
     MIN_KEYWORDS,
+    caveman_handle_prompt,
     extract_keywords,
     extract_snippet,
     find_memory_dir,
@@ -48,18 +49,35 @@ def main() -> None:
     cwd = payload.get("cwd")
     prompt = payload.get("prompt") or payload.get("user_prompt_text") or ""
 
+    # Caveman (output-token compression) — independent of project memory, runs every
+    # turn: handles /caveman + "stop caveman" and emits the per-turn style anchor.
+    # Keyed by session_id so mode changes never bleed across concurrently-open
+    # sessions on other projects.
+    caveman_note = caveman_handle_prompt(prompt, session_key(payload))
+
+    # Memory deltas — keyword-matched files not yet injected this session.
+    mem_out = _memory_hits(payload, cwd, prompt)
+
+    chunks = [c for c in (caveman_note, mem_out) if c]
+    if chunks:
+        sys.stdout.write("\n\n".join(chunks))
+
+
+def _memory_hits(payload: dict, cwd: str | None, prompt: str) -> str:
+    """Return keyword-matched memory deltas (files not already surfaced this session),
+    or '' when there is nothing NEW to inject."""
     mem = find_memory_dir(cwd)
     if not mem:
-        return
+        return ""
 
     keywords = extract_keywords(prompt)
     if len(keywords) < MIN_KEYWORDS:
-        return
+        return ""
 
     # Strict inject gate: coverage + relevance floor (kills weak/irrelevant hits).
     matches = grep_memory(mem, keywords, max_files=3, inject=True)
     if not matches:
-        return
+        return ""
 
     # Cross-turn dedup: skip any file already injected this session (or pre-seeded
     # by SessionStart). Fail-silent — missing session id → empty set → no dedup.
@@ -83,14 +101,12 @@ def main() -> None:
         used += len(block)
 
     if not blocks:  # nothing NEW survived — emit nothing (not even the header)
-        return
-
-    out = format_budget(HEADER + "".join(blocks), BUDGET_USER_PROMPT)
-    sys.stdout.write(out)
+        return ""
 
     # Record what we injected so later turns don't repeat it; bound the dir.
     save_seen(sid, seen | emitted)
     prune_old_ledgers()
+    return format_budget(HEADER + "".join(blocks), BUDGET_USER_PROMPT)
 
 
 if __name__ == "__main__":
