@@ -89,18 +89,24 @@ def project_slug_from_cwd(cwd: str | None) -> str | None:
     """
     Claude Code stores per-project data under ~/.claude/projects/<slug>/.
     The slug is the full cwd with every `:`, `/`, `\\`, `.`, AND whitespace
-    mapped to `-`, then leading dashes stripped. The whitespace mapping is
-    essential: a path like "D:\\CLAUDE\\My App" becomes "D--CLAUDE-My-App"
-    (matching Claude Code's own slug) — without it the space survived and the
-    memory lookup silently fell back to the PARENT project's memory. Examples:
+    mapped to `-`. The whitespace mapping is essential: a path like
+    "D:\\CLAUDE\\My App" becomes "D--CLAUDE-My-App" (matching Claude Code's own
+    slug) — without it the space survived and the memory lookup silently fell
+    back to the PARENT project's memory.
+
+    The leading dash is NOT stripped. On Unix an absolute path starts with `/`,
+    so the slug legitimately starts with `-` (/Users/ann/app → -Users-ann-app),
+    exactly as Claude Code names the directory. Stripping it made every lookup
+    on macOS/Linux miss, and the hooks then exited silently. Windows paths start
+    with a drive letter, so they are unaffected either way. Examples:
         D:\\CLAUDE\\my-project                 → D--CLAUDE-my-project
         D:\\CLAUDE\\My App                     → D--CLAUDE-My-App
-        D:\\CLAUDE\\my-project\\.claude\\w\\x  → D--CLAUDE-my-project--claude-w-x
+        /Users/ann/my-project                 → -Users-ann-my-project
+        /home/ann/my project                  → -home-ann-my-project
     """
     if not cwd:
         return None
-    slug = re.sub(r"[:\\/.\s]", "-", cwd)
-    return slug.lstrip("-")
+    return re.sub(r"[:\\/.\s]", "-", cwd)
 
 
 def find_memory_dir(cwd: str | None) -> Path | None:

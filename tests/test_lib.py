@@ -41,7 +41,14 @@ def test_slug_windows_worktree():
 
 
 def test_slug_posix_repo_root():
-    assert lib.project_slug_from_cwd("/home/user/my-project") == "home-user-my-project"
+    # The leading dash is part of the slug: Claude Code maps the absolute path's
+    # leading `/` to `-`, so the directory really is `-home-user-my-project`.
+    # Stripping it made every macOS/Linux lookup miss and the hooks exit silently.
+    assert lib.project_slug_from_cwd("/home/user/my-project") == "-home-user-my-project"
+
+
+def test_slug_posix_keeps_leading_dash_with_space():
+    assert lib.project_slug_from_cwd("/Users/ann/My App") == "-Users-ann-My-App"
 
 
 def test_slug_none_input():

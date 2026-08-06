@@ -63,14 +63,30 @@ def save_settings(data: dict) -> None:
     os.replace(tmp, SETTINGS)
 
 
+def hook_interpreter() -> str:
+    """
+    Interpreter command written into the hook entries.
+
+    `python` is NOT portable: on macOS and most current Linux distros only
+    `python3` exists, so a hardcoded `python` makes every hook die with
+    "command not found" — silently, since hook stderr is not surfaced.
+    Probe PATH in platform order and fall back to the absolute interpreter
+    running this installer, which is guaranteed to exist.
+    """
+    candidates = ("python", "python3") if os.name == "nt" else ("python3", "python")
+    for cmd in candidates:
+        if shutil.which(cmd):
+            return cmd
+    return f'"{Path(sys.executable).as_posix()}"'
+
+
 def build_hook_entry(script_path: Path) -> dict:
-    # Use `python` explicitly for cross-platform compat. Absolute path to script.
-    # Works in Git Bash on Windows, macOS, Linux.
+    # Absolute path to the script; interpreter resolved per platform.
     return {
         "hooks": [
             {
                 "type": "command",
-                "command": f'python "{script_path.as_posix()}"',
+                "command": f'{hook_interpreter()} "{script_path.as_posix()}"',
             }
         ]
     }
