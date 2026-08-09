@@ -32,13 +32,18 @@ for _stream in (sys.stdout, sys.stderr):
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_HOME") or (Path.home() / ".claude"))
 PROJECTS_ROOT = CLAUDE_HOME / "projects"
 
-# Budgets (characters, ~4 chars per token). Tightened for the "lean everywhere"
-# default: the index is line-clipped + the PreCompact resume is already small, so
-# the whole SessionStart payload stays well under this cap without losing the map.
-BUDGET_SESSION_START = 4500       # ~1125 tokens (was 6000)
-BUDGET_USER_PROMPT = 1600         # ~400 tokens
-BUDGET_SNIPPET = 600              # ~150 tokens per file
-BUDGET_INDEX_LINES = 60           # max lines of MEMORY.md to include
+# Budgets (characters, ~4 chars per token).
+#
+# These were squeezed hard for a "lean everywhere" default, which turned out to
+# be a bad trade: on projects with a large memory dir the index got clipped and
+# per-turn snippets were too small to carry a decision, so the model worked from
+# a partial picture and produced confidently wrong output. Recall quality is the
+# entire point of this tool — a few hundred tokens per turn is cheaper than one
+# wrong answer. Raised back above the pre-lean values.
+BUDGET_SESSION_START = 8000       # ~2000 tokens (was 4500, originally 6000)
+BUDGET_USER_PROMPT = 3000         # ~750 tokens (was 1600)
+BUDGET_SNIPPET = 1000             # ~250 tokens per file (was 600)
+BUDGET_INDEX_LINES = 120          # max lines of MEMORY.md to include (was 60)
 MIN_KEYWORDS = 2                  # min keywords to trigger inject
 MIN_KEYWORD_LEN = 4
 MAX_SCAN_FILES = 400              # cap files scanned per grep_memory() call — bounds
@@ -56,9 +61,15 @@ NOISE_MIN_NOISY_LINES = 6         # absolute floor so a tiny note isn't nuked
 # ── Ultra v2: relevance gating + per-session inject ledger ──
 # These ONLY affect the per-turn inject path (grep_memory(..., inject=True) used
 # by the UserPromptSubmit hook). Recall / other callers are unchanged.
-MIN_SCORE_ABS = 3.0               # absolute score floor — below this, never inject
-MIN_SCORE_REL_FRAC = 0.5          # keep only files >= this fraction of the top score
-INJECT_MIN_COVERAGE = 2           # require >= min(this, #keywords) distinct keyword hits
+# Relaxed after the gates proved too aggressive in practice: a follow-up like
+# "co jsme dělali s tím videem" carries few distinct keywords, so the coverage
+# gate + 50 % relative floor dropped the very notes that answered it and the hook
+# injected nothing at all. Silence here is indistinguishable from "no memory
+# exists", which is exactly how the amnesia looked from the outside. Prefer one
+# extra ~250-token snippet over a confidently wrong answer.
+MIN_SCORE_ABS = 1.5               # absolute score floor (was 3.0)
+MIN_SCORE_REL_FRAC = 0.25         # keep files >= this fraction of top score (was 0.5)
+INJECT_MIN_COVERAGE = 1           # distinct keyword hits required (was 2)
 ACRONYM_MIN_LEN = 2               # keep high-signal ALL-CAPS acronyms (KDP, TCG, OG, AWS)
 LEDGER_DIRNAME = "seen"           # under CLAUDE_HOME/.megamind/<LEDGER_DIRNAME>/
 LEDGER_MAX_AGE_SEC = 86400        # prune per-session inject ledgers older than 24h
@@ -171,8 +182,24 @@ def _word_count(low: str, k: str) -> int:
     """Word-boundary occurrence count of keyword k in already-lowercased text low.
     Plain substring counting (the old behaviour) scored false hits inside unrelated
     words ("note" inside "annotate"/"denote"/"notebook"), inflating both the TF
-    term and the coverage gate that decides whether a file gets auto-injected."""
-    return len(re.findall(rf"\b{re.escape(k)}\b", low))
+    term and the coverage gate that decides whether a file gets auto-injected.
+
+    Falls back to a stem match for inflected languages. Czech (and Slavic
+    languages generally) decline nouns heavily, so an exact word-boundary match
+    silently failed on the most natural way to ask a question: "co jsme dělali
+    s tím videem" never matched a note about "video", and the hook injected
+    nothing at all. Only applies to words long enough for a trimmed stem to stay
+    specific, and only when the exact match found nothing, so English matching is
+    unchanged and short words cannot start matching everything.
+    """
+    exact = len(re.findall(rf"\b{re.escape(k)}\b", low))
+    if exact or len(k) < 5:
+        return exact
+    stem = k[:-2] if len(k) >= 6 else k[:-1]
+    if len(stem) < 4:
+        return exact
+    # allow up to 4 trailing chars: video/videa/videem/videích, práce/pracovat…
+    return len(re.findall(rf"\b{re.escape(stem)}\w{{0,4}}\b", low))
 
 
 def score_file_detail(path: Path, keywords: set[str]) -> tuple[float, int]:
@@ -538,6 +565,23 @@ def save_seen(session_id: str | None, relpaths: set[str]) -> None:
         tmp = p.with_suffix(".tmp")
         tmp.write_text(json.dumps(sorted(relpaths)), encoding="utf-8")
         os.replace(tmp, p)
+    except Exception:
+        pass
+
+
+def clear_seen(session_id: str | None) -> None:
+    """Drop this session's inject ledger.
+
+    MUST be called on compaction. The ledger's whole premise is "already in the
+    context window, re-injecting adds nothing" — compaction destroys that window,
+    so a surviving ledger permanently suppresses memory that is no longer present.
+    That silently degraded long sessions into amnesia: the model kept working
+    without the project facts it had been given hours earlier. Fail-silent.
+    """
+    if not session_id:
+        return
+    try:
+        _ledger_path(session_id).unlink(missing_ok=True)
     except Exception:
         pass
 

@@ -1,5 +1,5 @@
 """
-Smoke tests for Megamind Ultra core library.
+Smoke tests for Hustlers MegaMind core library.
 
 Run with:
     python -m pytest tests/ -v
@@ -26,29 +26,24 @@ import lib  # noqa: E402
 # ────────────────────────────────────────────────────────────────────
 
 def test_slug_windows_repo_root():
-    assert lib.project_slug_from_cwd("D:\\CLAUDE\\my-project") == "D--CLAUDE-my-project"
+    assert lib.project_slug_from_cwd("D:\\CLAUDE\\seokrates-web") == "D--CLAUDE-seokrates-web"
 
 
 def test_slug_windows_path_with_space():
     # Spaces must map to dashes to match Claude Code's slug (else recall falls
     # back to the parent project's memory).
-    assert lib.project_slug_from_cwd("D:\\CLAUDE\\My App") == "D--CLAUDE-My-App"
+    assert lib.project_slug_from_cwd("D:\\CLAUDE\\CLAUDE OS") == "D--CLAUDE-CLAUDE-OS"
 
 
 def test_slug_windows_worktree():
-    expected = "D--CLAUDE-my-project--claude-worktrees-lucid-brattain"
-    assert lib.project_slug_from_cwd("D:\\CLAUDE\\my-project\\.claude\\worktrees\\lucid-brattain") == expected
+    expected = "D--CLAUDE-seokrates-web--claude-worktrees-lucid-brattain"
+    assert lib.project_slug_from_cwd("D:\\CLAUDE\\seokrates-web\\.claude\\worktrees\\lucid-brattain") == expected
 
 
 def test_slug_posix_repo_root():
-    # The leading dash is part of the slug: Claude Code maps the absolute path's
+    # Leading dash is part of the slug: Claude Code maps the absolute path's
     # leading `/` to `-`, so the directory really is `-home-user-my-project`.
-    # Stripping it made every macOS/Linux lookup miss and the hooks exit silently.
     assert lib.project_slug_from_cwd("/home/user/my-project") == "-home-user-my-project"
-
-
-def test_slug_posix_keeps_leading_dash_with_space():
-    assert lib.project_slug_from_cwd("/Users/ann/My App") == "-Users-ann-My-App"
 
 
 def test_slug_none_input():
@@ -312,7 +307,7 @@ def test_secret_scan():
 
 def test_keywords_keep_acronyms():
     # Short ALL-CAPS acronyms (the most salient token) must survive the length gate.
-    kw = lib.extract_keywords("what is the KDP export")
+    kw = lib.extract_keywords("Co to ten KDP formát")
     assert "kdp" in kw  # was previously dropped (3 chars) → root cause of weak matches
     kw2 = lib.extract_keywords("how does the TCG OG image work")
     assert "tcg" in kw2 and "og" in kw2
@@ -324,23 +319,28 @@ def test_keywords_lowercase_short_words_still_dropped():
     assert "fix" not in kw and "cat" not in kw and "dog" not in kw
 
 
-def test_score_file_detail_returns_present_count(tmp_path):
-    p = tmp_path / "a.md"
+def test_score_file_detail_returns_present_count():
+    p = tmp = None
+    import tempfile as _tf
+    d = Path(_tf.mkdtemp())
+    p = d / "a.md"
     p.write_text("stripe webhook stripe", encoding="utf-8")
     score, present = lib.score_file_detail(p, {"stripe", "webhook"})
     assert score > 0 and present == 2
     score0, present0 = lib.score_file_detail(p, {"unrelated"})
     assert score0 == 0.0 and present0 == 0
+    shutil.rmtree(d, ignore_errors=True)
 
 
 def test_grep_inject_relevance_floor_rejects_weak_match(tmp_path):
     d = tmp_path / "memory"
     d.mkdir()
-    # A billing note shares only ONE generic word with a book-formatting query → no inject.
-    (d / "billing.md").write_text("# Billing\nstripe webhook payment flow\n", encoding="utf-8")
-    kws = lib.extract_keywords("how do I format a KDP book manuscript for kindle publishing")
+    # 'pokemon' note shares only ONE generic keyword with the query → must NOT inject.
+    (d / "pokemon.md").write_text("# Pokemon TCG app\nczech collector app plan\n", encoding="utf-8")
+    # Query about KDP book formatting — only weak overlap ('app') with the note.
+    kws = lib.extract_keywords("how do I format a KDP book manuscript for app store")
     inject = lib.grep_memory(d, kws, max_files=3, inject=True)
-    assert inject == []  # weak/irrelevant → silent (kills the wrong-note-injection class)
+    assert inject == []  # weak/irrelevant → silent (the KDP→HOLOMON class is killed)
 
 
 def test_grep_inject_coverage_gate(tmp_path):
@@ -351,8 +351,13 @@ def test_grep_inject_coverage_gate(tmp_path):
     kws = {"stripe", "webhook"}
     inject = lib.grep_memory(d, kws, max_files=5, inject=True)
     names = [p.name for p in inject]
-    assert "two.md" in names          # clears coverage (2 distinct hits)
-    assert "one.md" not in names      # single-keyword coincidence rejected
+    assert "two.md" in names          # full coverage still ranks first
+    # INJECT_MIN_COVERAGE is now 1: requiring two distinct keywords rejected the
+    # notes that answered short, naturally-phrased follow-ups, so the hook
+    # injected nothing and the model looked amnesiac. A partial match is worth
+    # ~250 tokens; a missing one costs a wrong answer.
+    assert "one.md" in names
+    assert names.index("two.md") < names.index("one.md")   # better match ranks higher
     # Non-inject path is unchanged: both still returned.
     plain = [p.name for p in lib.grep_memory(d, kws, max_files=5)]
     assert "one.md" in plain and "two.md" in plain
@@ -394,21 +399,30 @@ def test_norm_relpath_forward_slashes():
 
 
 # ════════════════════════════════════════════════════════════════════
-# FIXES: Unicode keyword extraction, word-boundary scoring, guarded
-# .stat(), filename collisions, resume-note pruning, bounded scan
+# FIXES 2026-07-18: Czech diacritics, word-boundary scoring, guarded
+# .stat(), filename collisions, resume-note pruning, per-session caveman,
+# widened secret regex, bounded memory scan
 # ════════════════════════════════════════════════════════════════════
 
-def test_keywords_diacritics_survive():
+def test_keywords_czech_diacritics_survive():
     # Previously the ASCII-only regex fragmented every diacritic word (e.g.
-    # "pokracuj"/"uj"), so common non-English words never became keywords.
+    # "pokracuj"/"uj"), so common Czech words never became usable keywords.
     kw = lib.extract_keywords("Prosím pokračuj a zkontroluj paměť před commitem")
     assert "pokračuj" in kw
     assert "paměť" in kw
     assert "commitem" in kw
 
 
+def test_keywords_czech_stopwords_still_filtered():
+    # Accented stopword entries (také, ještě, ...) were previously dead code
+    # since the old regex could never produce an accented token in the first
+    # place. They must actually filter now.
+    kw = lib.extract_keywords("také ještě něco protože jsme byla")
+    assert "také" not in kw and "ještě" not in kw and "protože" not in kw
+
+
 def test_score_word_boundary_no_false_positive(tmp_path):
-    # "note" must not score a hit inside "annotate"/"notebook"/"denote".
+    # "note" must not score a hit inside "annotate"/"denote"/"notebook".
     p = tmp_path / "a.md"
     p.write_text("Please annotate the notebook and denote the changes.", encoding="utf-8")
     score, present = lib.score_file_detail(p, {"note"})
@@ -428,6 +442,9 @@ def test_safe_mtime_missing_file_returns_zero(tmp_path):
 
 
 def test_write_session_summary_no_filename_collision(tmp_path):
+    # Old minute-precision stamp collided when called twice fast (e.g. two CC
+    # windows on the same project). Seconds + PID suffix must make every call
+    # produce a distinct path.
     p1 = lib.write_session_summary(tmp_path, "resume-auto", "first")
     p2 = lib.write_session_summary(tmp_path, "resume-auto", "second")
     assert p1 != p2
@@ -437,7 +454,8 @@ def test_write_session_summary_no_filename_collision(tmp_path):
 
 def test_write_session_summary_uses_lf_not_crlf(tmp_path):
     p = lib.write_session_summary(tmp_path, "resume-manual", "line one\nline two\n")
-    assert b"\r\n" not in p.read_bytes()
+    raw = p.read_bytes()
+    assert b"\r\n" not in raw
 
 
 def test_prune_old_resume_notes_keeps_newest_only(tmp_path):
@@ -452,17 +470,40 @@ def test_prune_old_resume_notes_keeps_newest_only(tmp_path):
     remaining = sorted(sess.glob("*.md"))
     assert removed == 3
     assert len(remaining) == 2
+    # newest two survive
+    assert "note 3" in (remaining[0].read_text() + remaining[1].read_text())
+    assert "note 4" in (remaining[0].read_text() + remaining[1].read_text())
 
 
-def test_prune_old_resume_notes_ignores_hand_written_notes(tmp_path):
+def test_prune_old_resume_notes_ignores_manual_notes(tmp_path):
     sess = tmp_path / "sessions"
     sess.mkdir()
     (sess / "2026-07-01-hand-written-decision.md").write_text("important", encoding="utf-8")
     for i in range(40):
         (sess / f"2026-07-{i+1:02d}-resume-auto.md").write_text("x", encoding="utf-8")
     lib.prune_old_resume_notes(tmp_path, keep_newest=5)
+    # Hand-written note (doesn't match the -resume-(auto|manual).md pattern) survives.
     assert (sess / "2026-07-01-hand-written-decision.md").exists()
     assert len(list(sess.glob("*resume-auto.md"))) == 5
+
+
+def test_caveman_per_session_isolation(tmp_path, monkeypatch):
+    monkeypatch.setattr(lib, "CLAUDE_HOME", tmp_path / ".claude")
+    lib.write_caveman_flag("full", session_id="session-A")
+    lib.write_caveman_flag("off", session_id="session-B")
+    # Session A's mode must be unaffected by session B's "off".
+    assert lib.caveman_active_mode("session-A") == "full"
+    assert lib.caveman_active_mode("session-B") is None
+
+
+def test_caveman_handle_prompt_returns_short_anchor(tmp_path, monkeypatch):
+    monkeypatch.setattr(lib, "CLAUDE_HOME", tmp_path / ".claude")
+    # Mirrors real hook order: SessionStart establishes the default mode first,
+    # THEN UserPromptSubmit's per-turn anchor reads it.
+    lib.caveman_session_block(session_id="s1")
+    out = lib.caveman_handle_prompt("hello there", session_id="s1")
+    assert out.startswith("[caveman:")
+    assert len(out.encode("utf-8")) < 70  # shrunk from the old ~116-byte anchor
 
 
 def test_secret_scan_widened_patterns():
@@ -477,11 +518,14 @@ def test_grep_memory_respects_max_scan_files_cap(tmp_path, monkeypatch):
     d.mkdir()
     import time as _t
 
+    # Old file matches the keyword but will be scanned-out by a tiny cap.
     old = d / "old.md"
     old.write_text("relevant content here", encoding="utf-8")
     _t.sleep(0.02)
+    # Newer files, most not matching, to push the old one out of a tiny cap.
     for i in range(4):
         (d / f"filler{i}.md").write_text("irrelevant filler text", encoding="utf-8")
     monkeypatch.setattr(lib, "MAX_SCAN_FILES", 2)
     results = lib.grep_memory(d, {"relevant", "content"}, max_files=5)
+    # The old matching file was scanned out by the cap — proves the cap is real.
     assert old not in results

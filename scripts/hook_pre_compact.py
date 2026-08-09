@@ -19,12 +19,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from lib import (
     build_resume,
+    clear_seen,
     find_memory_dir,
     iter_transcript_blocks,
     log_err,
     now_iso,
     prune_old_resume_notes,
     read_hook_input,
+    session_key,
     write_session_summary,
 )
 
@@ -34,6 +36,12 @@ def main() -> None:
     cwd = payload.get("cwd")
     transcript_path = payload.get("transcript_path")
     trigger = payload.get("trigger") or "unknown"  # 'auto' | 'manual'
+
+    # Compaction throws away the context window, so everything the inject ledger
+    # marked as "already delivered" is gone. Clear it FIRST — before any early
+    # return below — otherwise memory stays permanently suppressed for the rest
+    # of the session and the model silently loses the project's facts.
+    clear_seen(session_key(payload))
 
     mem = find_memory_dir(cwd)
     if not mem:
