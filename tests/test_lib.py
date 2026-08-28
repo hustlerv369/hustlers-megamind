@@ -458,21 +458,26 @@ def test_write_session_summary_uses_lf_not_crlf(tmp_path):
     assert b"\r\n" not in raw
 
 
-def test_prune_old_resume_notes_keeps_newest_only(tmp_path):
-    sess = tmp_path / "sessions"
-    sess.mkdir()
+def test_prune_old_resume_notes_archives_not_deletes(tmp_path):
+    mem = tmp_path / "memory"
+    sess = mem / "sessions"
+    sess.mkdir(parents=True)
     import time as _t
 
     for i in range(5):
         (sess / f"2026-07-{10+i:02d}-000000-0000-resume-auto.md").write_text(f"note {i}", encoding="utf-8")
         _t.sleep(0.01)
-    removed = lib.prune_old_resume_notes(tmp_path, keep_newest=2)
+    moved = lib.prune_old_resume_notes(mem, keep_newest=2)
     remaining = sorted(sess.glob("*.md"))
-    assert removed == 3
+    archived = sorted((tmp_path / "memory-archive" / "sessions").glob("*.md"))
+    assert moved == 3
     assert len(remaining) == 2
-    # newest two survive
+    assert len(archived) == 3
+    # newest two survive in the hot path
     assert "note 3" in (remaining[0].read_text() + remaining[1].read_text())
     assert "note 4" in (remaining[0].read_text() + remaining[1].read_text())
+    # oldest three are archived, NOT deleted — content fully intact
+    assert {p.read_text(encoding="utf-8") for p in archived} == {"note 0", "note 1", "note 2"}
 
 
 def test_prune_old_resume_notes_ignores_manual_notes(tmp_path):
@@ -513,7 +518,7 @@ def test_secret_scan_widened_patterns():
     assert not lib.scan_secrets("no secrets here, just normal prose about code")
 
 
-def test_grep_memory_respects_max_scan_files_cap(tmp_path, monkeypatch):
+def test_grep_memory_max_scan_files_cap_applies_only_to_inject(tmp_path, monkeypatch):
     d = tmp_path / "memory"
     d.mkdir()
     import time as _t
@@ -526,6 +531,10 @@ def test_grep_memory_respects_max_scan_files_cap(tmp_path, monkeypatch):
     for i in range(4):
         (d / f"filler{i}.md").write_text("irrelevant filler text", encoding="utf-8")
     monkeypatch.setattr(lib, "MAX_SCAN_FILES", 2)
-    results = lib.grep_memory(d, {"relevant", "content"}, max_files=5)
-    # The old matching file was scanned out by the cap — proves the cap is real.
-    assert old not in results
+    # Automatic per-turn path IS capped — old file scanned out (bounds per-turn cost).
+    inject_results = lib.grep_memory(d, {"relevant", "content"}, max_files=5, inject=True)
+    assert old not in inject_results
+    # Deliberate `recall` path is NEVER capped — the old file must still be found.
+    # Never forget: only the auto-inject convenience path trades completeness for speed.
+    recall_results = lib.grep_memory(d, {"relevant", "content"}, max_files=5)
+    assert old in recall_results

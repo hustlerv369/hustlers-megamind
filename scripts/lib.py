@@ -293,9 +293,11 @@ def grep_memory(
         return []
     need = min(INJECT_MIN_COVERAGE, len(keywords)) if inject else 0
     md_files = list(mem_dir.rglob("*.md"))
-    if len(md_files) > MAX_SCAN_FILES:
+    if inject and len(md_files) > MAX_SCAN_FILES:
         # Bound worst-case per-turn cost as memory grows; bias toward the most
-        # recently touched files (most likely relevant) when a cap is actually hit.
+        # recently touched files. Applied ONLY to the automatic per-turn path —
+        # a deliberate `cli.py recall` call is never capped, so nothing is ever
+        # permanently unreachable, only excluded from the best-effort auto-inject.
         md_files.sort(key=_safe_mtime, reverse=True)
         md_files = md_files[:MAX_SCAN_FILES]
     results: list[tuple[float, Path]] = []
@@ -453,12 +455,17 @@ _RE_RESUME_NAME = re.compile(r"-resume-(auto|manual)\.md$")
 
 
 def prune_old_resume_notes(mem_dir: Path, keep_newest: int = RESUME_NOTE_KEEP) -> int:
-    """Cap the number of PreCompact-generated resume snapshots kept under
-    memory/sessions/ — write_session_summary() only ever appends, so without this
-    a long-lived project accumulates one file per compaction forever. Matches
-    ONLY the auto-generated `*-resume-(auto|manual).md` naming pattern; hand-written
-    session notes never match and are never touched. Fully fail-silent; returns the
-    count removed (0 on any error, including 'nothing to prune')."""
+    """Move old PreCompact-generated resume snapshots out of the hot scan path
+    once a project accumulates more than keep_newest — write_session_summary()
+    only ever appends, so without this a long-lived project accumulates one
+    file per compaction forever. NEVER deletes anything: archived to
+    <project>/memory-archive/sessions/, a sibling directory outside memory/ so
+    grep_memory's rglob never re-scans it (bounding per-turn cost) while the
+    content stays fully on disk, git-history-recoverable, and trivially
+    restorable by moving it back. Matches ONLY the auto-generated
+    `*-resume-(auto|manual).md` naming pattern; hand-written session notes never
+    match and are never touched. Fully fail-silent; returns the count archived
+    (0 on any error, including 'nothing to prune')."""
     try:
         sess_dir = mem_dir / "sessions"
         if not sess_dir.exists():
@@ -467,14 +474,19 @@ def prune_old_resume_notes(mem_dir: Path, keep_newest: int = RESUME_NOTE_KEEP) -
         if len(notes) <= keep_newest:
             return 0
         notes.sort(key=_safe_mtime, reverse=True)
-        removed = 0
+        archive_dir = mem_dir.parent / "memory-archive" / "sessions"
+        moved = 0
         for p in notes[keep_newest:]:
             try:
-                p.unlink()
-                removed += 1
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                dest = archive_dir / p.name
+                if dest.exists():  # never clobber; leave it where it is
+                    continue
+                shutil.move(str(p), str(dest))
+                moved += 1
             except Exception:
                 pass
-        return removed
+        return moved
     except Exception:
         return 0
 
