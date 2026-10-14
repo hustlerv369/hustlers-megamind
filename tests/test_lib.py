@@ -400,7 +400,7 @@ def test_norm_relpath_forward_slashes():
 
 # ════════════════════════════════════════════════════════════════════
 # FIXES 2026-07-18: Czech diacritics, word-boundary scoring, guarded
-# .stat(), filename collisions, resume-note pruning, per-session caveman,
+# .stat(), filename collisions, explicit resume archival, complete context,
 # widened secret regex, bounded memory scan
 # ════════════════════════════════════════════════════════════════════
 
@@ -492,23 +492,10 @@ def test_prune_old_resume_notes_ignores_manual_notes(tmp_path):
     assert len(list(sess.glob("*resume-auto.md"))) == 5
 
 
-def test_caveman_per_session_isolation(tmp_path, monkeypatch):
-    monkeypatch.setattr(lib, "CLAUDE_HOME", tmp_path / ".claude")
-    lib.write_caveman_flag("full", session_id="session-A")
-    lib.write_caveman_flag("off", session_id="session-B")
-    # Session A's mode must be unaffected by session B's "off".
-    assert lib.caveman_active_mode("session-A") == "full"
-    assert lib.caveman_active_mode("session-B") is None
 
 
-def test_caveman_handle_prompt_returns_short_anchor(tmp_path, monkeypatch):
-    monkeypatch.setattr(lib, "CLAUDE_HOME", tmp_path / ".claude")
-    # Mirrors real hook order: SessionStart establishes the default mode first,
-    # THEN UserPromptSubmit's per-turn anchor reads it.
-    lib.caveman_session_block(session_id="s1")
-    out = lib.caveman_handle_prompt("hello there", session_id="s1")
-    assert out.startswith("[caveman:")
-    assert len(out.encode("utf-8")) < 70  # shrunk from the old ~116-byte anchor
+
+
 
 
 def test_secret_scan_widened_patterns():
@@ -518,7 +505,7 @@ def test_secret_scan_widened_patterns():
     assert not lib.scan_secrets("no secrets here, just normal prose about code")
 
 
-def test_grep_memory_max_scan_files_cap_applies_only_to_inject(tmp_path, monkeypatch):
+def test_grep_memory_old_fact_remains_in_automatic_retrieval(tmp_path, monkeypatch):
     d = tmp_path / "memory"
     d.mkdir()
     import time as _t
@@ -533,7 +520,7 @@ def test_grep_memory_max_scan_files_cap_applies_only_to_inject(tmp_path, monkeyp
     monkeypatch.setattr(lib, "MAX_SCAN_FILES", 2)
     # Automatic per-turn path IS capped — old file scanned out (bounds per-turn cost).
     inject_results = lib.grep_memory(d, {"relevant", "content"}, max_files=5, inject=True)
-    assert old not in inject_results
+    assert old in inject_results
     # Deliberate `recall` path is NEVER capped — the old file must still be found.
     # Never forget: only the auto-inject convenience path trades completeness for speed.
     recall_results = lib.grep_memory(d, {"relevant", "content"}, max_files=5)

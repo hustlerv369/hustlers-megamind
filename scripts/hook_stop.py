@@ -32,30 +32,16 @@ def main() -> None:
     # swallowed: a missing/broken vault.py can never break the Stop hook.
     try:
         import vault  # local module
+        from lib import log_err
 
-        slug = project_slug_from_cwd(cwd)
+        slug = mem.parent.name
         if slug:
-            vault.sync(slug)
-    except Exception:
-        pass
-    # 3) Refresh the OpenCode brain bridge so MiniMax/Kimi in the OpenCode panel
-    # share the same Megamind memory as Claude — scoped to THIS project's cwd
-    # (previously hardcoded to one fixed project, so every other project's Stop
-    # event silently overwrote the bridge file with the wrong project's memory).
-    # Best-effort, timeboxed, fully swallowed — never blocks turn-end.
-    try:
-        import subprocess  # stdlib
-
-        bridge = Path(__file__).parent / "opencode_bridge.py"
-        if bridge.exists() and cwd:
-            subprocess.run(
-                [sys.executable, str(bridge), cwd],
-                timeout=15,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-    except Exception:
-        pass
+            result = vault.sync(slug)
+            if result.startswith('ABORT') or 'failed' in result:
+                log_err(result)
+    except Exception as exc:
+        from lib import log_err
+        log_err(f'vault sync failed ({type(exc).__name__}); local notes retained')
 
 
 if __name__ == "__main__":

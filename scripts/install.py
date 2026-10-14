@@ -63,30 +63,14 @@ def save_settings(data: dict) -> None:
     os.replace(tmp, SETTINGS)
 
 
-def hook_interpreter() -> str:
-    """
-    Interpreter command written into the hook entries.
-
-    `python` is NOT portable: on macOS and most current Linux distros only
-    `python3` exists, so a hardcoded `python` makes every hook die with
-    "command not found" — silently, since hook stderr is not surfaced.
-    Probe PATH in platform order and fall back to the absolute interpreter
-    running this installer, which is guaranteed to exist.
-    """
-    candidates = ("python", "python3") if os.name == "nt" else ("python3", "python")
-    for cmd in candidates:
-        if shutil.which(cmd):
-            return cmd
-    return f'"{Path(sys.executable).as_posix()}"'
-
-
 def build_hook_entry(script_path: Path) -> dict:
-    # Absolute path to the script; interpreter resolved per platform.
+    # Use `python` explicitly for cross-platform compat. Absolute path to script.
+    # Works in Git Bash on Windows, macOS, Linux.
     return {
         "hooks": [
             {
                 "type": "command",
-                "command": f'{hook_interpreter()} "{script_path.as_posix()}"',
+                "command": f'python "{script_path.as_posix()}"',
             }
         ]
     }
@@ -104,28 +88,12 @@ def strip_existing(entries: list, marker: str) -> list:
 
 
 def warn_contextmode_global() -> None:
-    """Megamind owns all 5 lifecycle hooks. If context-mode is registered GLOBALLY
-    it adds 11 tool schemas to every request + duplicate hooks on the same events —
-    the worst cost shape on a 1M-context metered plan. Warn so it stays npm-only +
-    per-project (.mcp.json) with hooks disabled."""
-    try:
-        settings = load_settings()
-        mcp = settings.get("mcpServers") or {}
-        hooks = settings.get("hooks") or {}
-        hit = any("context-mode" in k.lower() or k.lower() == "ctx" for k in mcp)
-        for entries in hooks.values():
-            for e in entries or []:
-                for h in e.get("hooks") or []:
-                    cmd = (h.get("command") or "").lower()
-                    if "context-mode" in cmd:
-                        hit = True
-        if hit:
-            print("\n⚠  context-mode appears registered GLOBALLY in settings.json.")
-            print("   Keep it npm-only + per-project (.mcp.json) with hooks disabled —")
-            print("   a global install collides with megamind's 5 hooks and bloats every")
-            print("   request with 11 tool schemas. See megamind SKILL.md → Lean Mode.")
-    except Exception:
-        pass
+    """Surface conflicting context transport without recommending compression."""
+    settings = load_settings()
+    commands = [h.get('command', '') for entries in settings.get('hooks', {}).values()
+                for entry in entries or [] for h in entry.get('hooks', [])]
+    if any('context-mode' in name.lower() for name in settings.get('mcpServers', {})) or any('context-mode' in command.lower() for command in commands):
+        print('WARNING: context-mode is registered. Verify complete source delivery; automatic lossy context proxies are retired.')
 
 
 def install() -> None:

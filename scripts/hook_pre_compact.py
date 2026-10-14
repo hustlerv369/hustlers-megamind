@@ -58,6 +58,9 @@ def main() -> None:
                 f"# Resume snapshot — {now_iso()}",
                 "",
                 f"Trigger: `{trigger}`",
+                f"Session: {session_key(payload) or 'unknown'}",
+                f"Project: {cwd}",
+                f"Transcript source: {transcript_path or 'unavailable'}",
                 "",
                 "Clean structured resume written right before compaction. The raw transcript,",
                 "base64 blobs, and tool JSON were stripped at write time so future sessions",
@@ -69,7 +72,7 @@ def main() -> None:
             ]
         )
         write_session_summary(mem, f"resume-{trigger}", body)
-        prune_old_resume_notes(mem)
+        # Retain checkpoints; no automatic archiving from the searchable memory.
     except Exception as exc:
         # Only truly unexpected failures get logged; the expected
         # empty/absent-transcript path is silent to keep PreCompact at 0 tokens.

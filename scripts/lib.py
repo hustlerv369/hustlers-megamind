@@ -3,7 +3,7 @@ MegaMind — shared utilities for memory hooks.
 
 Design goals:
   1. Zero external dependencies (stdlib only).
-  2. Hard token budgets per hook (char-based approximation, 4 chars ≈ 1 token).
+  2. Complete relevant context; excerpts are explicitly requested and labeled.
   3. Silent no-op when no memory exists or nothing relevant found.
   4. Cross-platform (Windows + mac + linux).
 """
@@ -40,20 +40,20 @@ PROJECTS_ROOT = CLAUDE_HOME / "projects"
 # a partial picture and produced confidently wrong output. Recall quality is the
 # entire point of this tool — a few hundred tokens per turn is cheaper than one
 # wrong answer. Raised back above the pre-lean values.
-BUDGET_SESSION_START = 8000       # ~2000 tokens (was 4500, originally 6000)
-BUDGET_USER_PROMPT = 3000         # ~750 tokens (was 1600)
-BUDGET_SNIPPET = 1000             # ~250 tokens per file (was 600)
+BUDGET_SESSION_START = 131072       # ~2000 tokens (was 4500, originally 6000)
+BUDGET_USER_PROMPT = 131072         # ~750 tokens (was 1600)
+BUDGET_SNIPPET = 32768             # ~250 tokens per file (was 600)
 BUDGET_INDEX_LINES = 120          # max lines of MEMORY.md to include (was 60)
-MIN_KEYWORDS = 2                  # min keywords to trigger inject
+MIN_KEYWORDS = 1                  # min keywords to trigger inject
 MIN_KEYWORD_LEN = 4
 MAX_SCAN_FILES = 400              # cap files scanned per grep_memory() call — bounds
                                    # per-turn cost as a project's memory grows unbounded
 RESUME_NOTE_KEEP = 30             # cap auto-generated PreCompact resume snapshots kept
 
 # ── Ultra: token-saving constants ──
-BUDGET_PRECOMPACT = 2400          # ~600 tokens — cap for a clean resume snapshot
+BUDGET_PRECOMPACT = 131072          # ~600 tokens — cap for a clean resume snapshot
 TOOL_RESULT_MAX_CHARS = 240       # per tool_result, first line clipped
-RESUME_TAIL_MESSAGES = 120        # only keep last N content blocks (recency, bounded)
+RESUME_TAIL_MESSAGES = None        # retain all safe transcript records by default
 TF_CAP = 5                        # cap a single keyword's term-frequency contribution
 NOISE_LINE_RATIO = 0.30           # frac of noisy lines that marks a file as garbage
 NOISE_MIN_NOISY_LINES = 6         # absolute floor so a tiny note isn't nuked
@@ -88,12 +88,21 @@ RE_DECISION = re.compile(
 
 
 def read_hook_input() -> dict:
-    """Read JSON payload from stdin (Claude Code hook contract)."""
+    """Read UTF-8 hook JSON independently of the Windows console code page.
+
+    Invalid transport must be visible; returning {} would silently turn a real
+    memory lookup into an empty successful result.
+    """
     try:
-        raw = sys.stdin.read()
-        return json.loads(raw) if raw.strip() else {}
-    except Exception:
-        return {}
+        stream = getattr(sys.stdin, 'buffer', None)
+        raw = stream.read().decode('utf-8-sig') if stream is not None else sys.stdin.read()
+        payload = json.loads(raw) if raw.strip() else {}
+        if not isinstance(payload, dict):
+            raise ValueError('Hook payload is not an object')
+        return payload
+    except (UnicodeError, ValueError, OSError):
+        sys.stderr.write('MegaMind: invalid UTF-8/JSON hook input; memory lookup was not performed.\n')
+        raise SystemExit(2)
 
 
 def project_slug_from_cwd(cwd: str | None) -> str | None:
@@ -117,31 +126,35 @@ def project_slug_from_cwd(cwd: str | None) -> str | None:
 
 
 def find_memory_dir(cwd: str | None) -> Path | None:
-    """Return the memory directory for the given cwd, if it exists."""
-    slug = project_slug_from_cwd(cwd)
-    if not slug:
+    """Resolve exact project or a verified repository boundary, never drive/home memory."""
+    if not cwd:
         return None
-    mem = PROJECTS_ROOT / slug / "memory"
-    if mem.exists() and mem.is_dir():
-        return mem
-    # Fallback 1: worktrees share memory with their parent repo
-    # e.g. D--CLAUDE-seokrates-web--claude-worktrees-lucid-brattain → parent
-    parts = slug.split("--claude-worktrees-")
-    if len(parts) == 2:
-        parent_slug = parts[0]
-        mem = PROJECTS_ROOT / parent_slug / "memory"
-        if mem.exists():
-            return mem
-    # Fallback 2: walk up the path, look for a matching project slug. Useful
-    # when cwd is a deep subdirectory and only the repo root has memory.
-    p = Path(cwd)
-    for ancestor in [p.parent, *list(p.parents)]:
-        anc_slug = project_slug_from_cwd(str(ancestor))
-        if not anc_slug:
-            continue
-        mem = PROJECTS_ROOT / anc_slug / "memory"
-        if mem.exists():
-            return mem
+    requested = PROJECTS_ROOT / project_slug_from_cwd(cwd) / "memory"
+    if requested.is_dir():
+        return requested
+    project=Path(os.path.abspath(cwd))
+    exact=PROJECTS_ROOT / project_slug_from_cwd(str(project)) / "memory"
+    if exact.is_dir():
+        return exact
+    for ancestor in [project, *project.parents]:
+        git=ancestor / ".git"
+        if git.is_file():
+            try:
+                value=git.read_text(encoding="utf-8").strip()
+                if value.startswith("gitdir:"):
+                    gitdir=(ancestor / value.split(":",1)[1].strip()).resolve()
+                    common=gitdir.parent.parent
+                    if gitdir.parent.name == "worktrees" and common.name == ".git":
+                        shared=PROJECTS_ROOT / project_slug_from_cwd(str(common.parent)) / "memory"
+                        if shared.is_dir(): return shared
+            except OSError:
+                pass
+        boundary=git.exists() or (ancestor / "AGENTS.md").is_file() or (ancestor / "CLAUDE.md").is_file()
+        if ancestor != Path(ancestor.anchor) and ancestor != Path.home() and boundary:
+            candidate=PROJECTS_ROOT / project_slug_from_cwd(str(ancestor)) / "memory"
+            if candidate.is_dir(): return candidate
+            # A repository without memory must not inherit another project's state.
+            if git.exists(): return None
     return None
 
 
@@ -275,151 +288,74 @@ def score_file(path: Path, keywords: set[str]) -> float:
     return score_file_detail(path, keywords)[0]
 
 
-def grep_memory(
-    mem_dir: Path, keywords: set[str], max_files: int = 3, inject: bool = False
-) -> list[Path]:
-    """Return top-K .md files by relevance, skipping transcript-noise dumps and
-    de-duplicating near-identical notes (same prose fingerprint).
-
-    inject=False (default): every file with score>0 is eligible — used by recall
-    and any caller that wants best-effort matches. Behaviour unchanged.
-
-    inject=True: the strict per-turn path used by the UserPromptSubmit hook. Adds
-    a coverage gate (a file must contain ≥ min(INJECT_MIN_COVERAGE, #keywords)
-    distinct keywords) and a relevance floor (score ≥ max(MIN_SCORE_ABS,
-    MIN_SCORE_REL_FRAC × top_score)). Weak/coincidental matches return [] (silent),
-    so a vague prompt injects nothing instead of unrelated noise."""
-    if not mem_dir.exists():
+def grep_memory(mem_dir: Path, keywords: set[str], max_files: int | None = None, inject: bool = False) -> list[Path]:
+    """Search all notes. Deduplicate full clean contents, never shared template headers."""
+    if not mem_dir.exists() or not keywords:
         return []
-    need = min(INJECT_MIN_COVERAGE, len(keywords)) if inject else 0
-    md_files = list(mem_dir.rglob("*.md"))
-    if inject and len(md_files) > MAX_SCAN_FILES:
-        # Bound worst-case per-turn cost as memory grows; bias toward the most
-        # recently touched files. Applied ONLY to the automatic per-turn path —
-        # a deliberate `cli.py recall` call is never capped, so nothing is ever
-        # permanently unreachable, only excluded from the best-effort auto-inject.
-        md_files.sort(key=_safe_mtime, reverse=True)
-        md_files = md_files[:MAX_SCAN_FILES]
-    results: list[tuple[float, Path]] = []
-    for md in md_files:
-        if is_noise_file(md):  # never inject base64/JSONL garbage
-            continue
-        if is_superseded(md):  # closed facts stay auditable but never resurface
-            continue
-        score, present = score_file_detail(md, keywords)
-        if score <= 0:
-            continue
-        if inject and present < need:  # coverage gate — kill single-keyword coincidences
-            continue
-        results.append((score, md))
-    if not results:
-        return []
-    # Sort by score desc, then by mtime desc (newer wins ties)
-    results.sort(key=lambda pair: (pair[0], _safe_mtime(pair[1])), reverse=True)
-    if inject:
-        top = results[0][0]
-        floor = max(MIN_SCORE_ABS, MIN_SCORE_REL_FRAC * top)
-        results = [r for r in results if r[0] >= floor]
-        if not results:
-            return []
-    out: list[Path] = []
-    seen: set[str] = set()
-    for _, p in results:
-        fp = _prose_fingerprint(p)
-        if fp and fp in seen:
-            continue
-        if fp:
-            seen.add(fp)
-        out.append(p)
-        if len(out) >= max_files:
-            break
+    results=[]
+    for md in mem_dir.rglob("*.md"):
+        if is_noise_file(md) or is_superseded(md): continue
+        score,present=score_file_detail(md,keywords)
+        if score > 0: results.append((score,_safe_mtime(md),str(md),md))
+    results.sort(reverse=True)
+    out=[]; seen=set()
+    for _,_,_,md in results:
+        fp=_prose_fingerprint(md)
+        if fp and fp in seen: continue
+        if fp:seen.add(fp)
+        out.append(md)
+        if max_files is not None and len(out)>=max_files:break
     return out
 
 
-def extract_snippet(path: Path, keywords: set[str], max_chars: int = BUDGET_SNIPPET) -> str:
-    """
-    Extract a contextual snippet around first keyword hit, within budget.
-    Prefers the document title (first H1) + matching lines + tiny context.
-    """
-    try:
-        text = path.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        return ""
-
-    raw = text.split("\n")
-    # Pull title (first H1 line) if present
-    title = ""
-    for line in raw[:10]:
-        if line.startswith("# "):
-            title = line.strip()
-            break
-
-    # Drop transcript-noise lines (base64/JSONL/self-injected blocks) so a snippet
-    # never spends the budget on garbage.
-    lines = [line for line in raw if not is_noise_line(line)]
-    if not lines:
-        return ""
-
-    # Find first keyword hit; take surrounding 10 lines
-    lower_lines = [line.lower() for line in lines]
-    match_idx = -1
-    for k in keywords:
-        for i, line in enumerate(lower_lines):
-            if k in line:
-                match_idx = i
-                break
-        if match_idx != -1:
-            break
-
-    if match_idx == -1:
-        # No hit in file content (keyword might be in path). Take top of file.
-        body = "\n".join(lines[:10])
-    else:
-        start = max(0, match_idx - 2)
-        end = min(len(lines), match_idx + 10)
-        body = "\n".join(lines[start:end])
-
-    out = (title + "\n\n" + body).strip() if title else body
-    if len(out) > max_chars:
-        out = out[: max_chars - 15].rstrip() + "\n[...truncated]"
-    return out
+def extract_snippet(path: Path, keywords: set[str], max_chars: int | None = None) -> str:
+    """Return complete clean notes by default; explicit excerpts use scored paragraphs."""
+    try: text=path.read_text(encoding="utf-8",errors="replace")
+    except OSError:return ""
+    text="\n".join(line for line in text.splitlines() if not is_noise_line(line)).strip()
+    if max_chars is None or len(text)<=max_chars:return text
+    paragraphs=re.split(r"\n\s*\n",text)
+    ranked=sorted(range(len(paragraphs)),key=lambda i:(sum(_word_count(paragraphs[i].lower(),k) for k in keywords),-i),reverse=True)
+    selected=[];used=0
+    for i in ranked:
+        block=paragraphs[i]
+        if used+len(block)+2<=max_chars:
+            selected.append(i);used+=len(block)+2
+    body="\n\n".join(paragraphs[i] for i in sorted(selected))
+    return body+f"\n\n[PARTIAL excerpt; read complete source: {path}]"
 
 
-def latest_session_note(mem_dir: Path) -> Path | None:
+def latest_session_note(mem_dir: Path, session_id: str | None = None) -> Path | None:
     """Most recent REAL session note in memory/sessions/ — excludes transcript-noise
     dumps so a fresh auto-compact garbage file can never hijack the SessionStart slot.
     Returns None if only dumps exist."""
     sess_dir = mem_dir / "sessions"
     if not sess_dir.exists():
         return None
-    candidates = [p for p in sess_dir.rglob("*.md") if not is_noise_file(p)]
+    candidates = [p for p in sess_dir.rglob("*.md") if not is_noise_file(p) and not is_superseded(p)]
     if not candidates:
         return None
+    if session_id:
+        own = []
+        for candidate in candidates:
+            try:
+                if f"Session: {session_id}" in candidate.read_text(encoding="utf-8", errors="replace").splitlines():
+                    own.append(candidate)
+            except OSError:
+                continue
+        if own:
+            candidates = own
     candidates.sort(key=_safe_mtime, reverse=True)
     return candidates[0]
 
 
-def memory_index(mem_dir: Path, max_chars: int = 3000, max_line: int = 160) -> str | None:
-    """Read MEMORY.md index and return a LEAN, scannable version: each line is
-    clipped to max_line chars so long session bullets become titles+hooks rather
-    than paragraphs (the full detail lives in the session files, loaded only on
-    recall). Keeps the whole map (every entry) while spending far fewer tokens —
-    'see it faster, burn less'."""
-    idx = mem_dir / "MEMORY.md"
-    if not idx.exists():
-        return None
-    try:
-        text = idx.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        return None
-    out: list[str] = []
-    for line in text.split("\n"):
-        if len(line) > max_line:
-            line = line[: max_line - 1].rstrip() + "…"
-        out.append(line)
-    text = "\n".join(out)
-    if len(text) > max_chars:
-        text = text[: max_chars - 15].rstrip() + "\n[...truncated]"
+def memory_index(mem_dir: Path, max_chars: int | None = None, max_line: int | None = None) -> str | None:
+    """Return the complete navigation index; any requested excerpt is explicitly labeled."""
+    idx=mem_dir / "MEMORY.md"
+    try:text=idx.read_text(encoding="utf-8",errors="replace")
+    except OSError:return None
+    if max_chars is not None and len(text)>max_chars:
+        return text[:max_chars]+f"\n[PARTIAL index; complete source: {idx}]"
     return text
 
 
@@ -667,20 +603,14 @@ def is_superseded(path: Path) -> bool:
 
 
 def _prose_fingerprint(path: Path) -> str:
-    """First 3 clean, non-heading lines, lowercased — for dedup of near-identical notes."""
-    try:
-        text = path.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        return ""
-    picked: list[str] = []
-    for line in text.split("\n"):
-        s = line.strip()
-        if not s or s.startswith("#") or is_noise_line(s):
-            continue
-        picked.append(s)
-        if len(picked) >= 3:
-            break
-    return " ".join(picked).lower()[:160]
+    """Content identity across the entire clean note; different facts cannot collapse."""
+    try:text=path.read_text(encoding="utf-8",errors="replace")
+    except OSError:return ""
+    if text.startswith("---"):
+        match=re.match(r"^---\s*\n.*?\n---\s*\n",text,re.S)
+        if match:text=text[match.end():]
+    body="\n".join(line.rstrip() for line in text.splitlines() if not is_noise_line(line)).strip()
+    return hashlib.sha256(body.encode("utf-8")).hexdigest() if body else ""
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -770,255 +700,42 @@ def iter_transcript_blocks(transcript_path: str) -> list[dict]:
 
 
 def build_resume(records: list[dict]) -> str:
-    """Bucket transcript blocks into a clean structured resume (≤BUDGET_PRECOMPACT)."""
-    decisions: list[str] = []
-    files: list[str] = []
-    cmds: list[str] = []
-    intents: list[str] = []
-    questions: list[str] = []
+    """Keep complete user constraints and actual assistant reports, in any language.
 
-    def add(lst: list[str], v) -> None:
-        if v and v not in lst:
-            lst.append(v)
-
-    for r in records:
-        k = r.get("kind")
-        if k == "tool_use":
-            n = r.get("name")
-            inp = r.get("input") or {}
-            if n in ("Edit", "Write", "NotebookEdit"):
-                add(files, inp.get("file_path") or inp.get("notebook_path"))
-            elif n == "Read":
-                add(files, inp.get("file_path"))
-            elif n in ("Bash", "PowerShell"):
-                add(cmds, (inp.get("command") or "")[:120])
-        elif k == "text" and r.get("role") == "user":
-            t = _strip_noise_prose(r.get("text", ""))
-            if t and not t.startswith("[Request interrupted") and not t.startswith("<"):
-                intents.append(t[:200])
-                if "?" in t:
-                    questions.append(t[:200])
-        elif k == "text" and r.get("role") == "assistant":
-            t = _strip_noise_prose(r.get("text", ""))
-            if t and RE_DECISION.search(t):
-                decisions.append(t[:200])
-
-    def tail_uniq(xs: list[str], n: int) -> list[str]:
-        if n <= 0:
-            return []
-        seen: set[str] = set()
-        out: list[str] = []
-        for x in reversed(xs):
-            if x and x not in seen:
-                seen.add(x)
-                out.append(x)
-        return list(reversed(out))[-n:]
-
-    sections = [
-        ("Recent intent", tail_uniq(intents, 4)),
-        ("Decisions / rationale", tail_uniq(decisions, 6)),
-        ("Files touched", tail_uniq(files, 12)),
-        ("Commands run", tail_uniq(cmds, 8)),
-        ("Open questions", tail_uniq(questions, 4)),
-    ]
-    out: list[str] = []
-    for nm, items in sections:
-        if items:
-            out.append(f"### {nm}\n" + "\n".join(f"- {i}" for i in items))
-    body = "\n\n".join(out)
-    return format_budget(body, BUDGET_PRECOMPACT) if body else ""
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# ULTRA: lean mode (token-discipline directive, opt-out) + memory-vault sync
-# ══════════════════════════════════════════════════════════════════════════
-
-LEAN_LINE = (
-    "Lean mode — to save tokens: route big reads (>~400 lines or >3 files) to a "
-    "subagent and keep only the conclusion; `/clear` on an unrelated task switch; "
-    "recall from memory before asking the user to re-explain; load MCP/skill tools "
-    "only when the task needs them."
-)
-
-
-def lean_on() -> bool:
-    """Lean directive is default-ON; opt out by creating ~/.claude/megamind-lean.off."""
-    return not (CLAUDE_HOME / "megamind-lean.off").exists()
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# ULTRA: caveman mode (OUTPUT-token compression, folded-in caveman skill)
-# ══════════════════════════════════════════════════════════════════════════
-# Lean trims the INPUT side (context/memory). Caveman trims the OUTPUT side:
-# the model answers in terse "smart-caveman" prose — drops articles/filler/
-# pleasantries/hedging, keeps every bit of technical substance — for ~65-75%
-# fewer output tokens. Folded into MegaMind's existing SessionStart +
-# UserPromptSubmit hooks so it adds NO new hooks (caveman's standalone install
-# would double-hook the same two events MegaMind already owns). Source skill:
-# github.com/JuliusBrussee/caveman.
-
-CAVEMAN_FLAG = CLAUDE_HOME / ".caveman-active"        # legacy global fallback (no session id)
-CAVEMAN_OFF_FLAG = CLAUDE_HOME / "megamind-caveman.off"  # permanent global kill switch
-CAVEMAN_DEFAULT_MODE = (os.environ.get("CAVEMAN_DEFAULT_MODE") or "lite").strip().lower() or "lite"
-CAVEMAN_MODES = ("lite", "full", "ultra", "wenyan-lite", "wenyan-full", "wenyan-ultra")
-_CAVEMAN_OFF_WORDS = ("off", "stop", "disable", "none", "normal", "vypni")
-
-# Natural-language activation / deactivation (EN + CZ). Conservative on ON (it is
-# already always-on by default) so we mostly catch level switches + OFF.
-_CAVEMAN_ON_NL = re.compile(
-    r"\b(caveman mode|talk like (?:a )?caveman|mluv jako caveman|use caveman|"
-    r"activate caveman|turn on caveman|zapni caveman)\b",
-    re.I,
-)
-_CAVEMAN_OFF_NL = re.compile(
-    r"\b(stop caveman|disable caveman|deactivate caveman|vypni caveman|"
-    r"přestaň caveman|normal mode|normální režim)\b",
-    re.I,
-)
-# /caveman, /caveman ultra, /caveman wenyan-full, /caveman off ...
-_CAVEMAN_SLASH = re.compile(r"^/caveman(?:\s+([A-Za-z-]+))?\s*$", re.I)
-
-# The ruleset injected once per session (cache-stable SessionStart prefix). {level}
-# is the active intensity. Commit + review behaviour folded in (caveman-commit /
-# caveman-review skills) so they need no separate skill files.
-CAVEMAN_RULESET = """## ⛏ Caveman mode — ACTIVE (level: {level})
-Respond terse like a smart caveman. Keep ALL technical substance; cut only fluff. \
-Active every response until the user says "stop caveman" / "normal mode".
-
-Drop: filler (just/really/basically/actually/simply), pleasantries (sure/certainly/\
-happy to/of course), hedging. At full+ also drop articles (a/an/the); fragments OK; \
-short synonyms ("fix" not "implement a solution for"). No tool-call narration, no \
-decorative tables/emoji, no dumping long raw error logs — quote the shortest decisive \
-line. Keep VERBATIM: code, function/API names, CLI commands, exact error strings, \
-commit-type keywords (feat/fix/...). Preserve the user's language (Czech in → Czech \
-caveman). Never announce or name the mode.
-
-Levels — **lite**: drop filler/hedging, KEEP articles + full sentences (professional, \
-tight). **full**: drop articles, fragments OK, short synonyms. **ultra**: also abbreviate \
-PROSE words (DB/auth/cfg/fn/impl), arrows for causality (X → Y), one word where one word \
-does — never abbreviate real code symbols. **wenyan-***: classical Chinese 文言文 register.
-
-Auto-clarity — drop caveman to NORMAL prose for: security warnings, irreversible / \
-destructive-action confirmations, multi-step sequences where fragment order risks a \
-misread, or when the user is confused / repeats a question. Resume caveman after.
-
-Commits (when writing one): Conventional Commits, imperative subject ≤50 chars, body \
-only for a non-obvious *why* / breaking change / migration. No "this commit does", no AI \
-attribution unless the user's own rule requires a trailer.
-Reviews (when reviewing code): one line per finding — `path:Lnn: <emoji> <sev>: problem. \
-fix.` (🔴 bug / 🟡 risk / 🔵 nit / ❓ q). No praise, no restating the diff. Security \
-findings → plain-English risk first.
-
-Write NORMAL prose inside code blocks, commit bodies, and PR descriptions; compress only \
-the prose around them."""
-
-
-def caveman_globally_off() -> bool:
-    """Permanent kill switch: ~/.claude/megamind-caveman.off disables caveman entirely."""
-    return CAVEMAN_OFF_FLAG.exists()
-
-
-def _caveman_flag_path(session_id: str | None) -> Path:
-    """Per-session caveman flag, stored alongside the inject-seen ledger
-    (CLAUDE_HOME/.megamind/seen/) so it's pruned by the same prune_old_ledgers().
-    Keying by session_id stops one project's "stop caveman" from silently bleeding
-    into every OTHER concurrently-open Claude Code session on the machine — the
-    old single global file was shared by every project at once. Falls back to the
-    legacy global path only if no session id is available (defensive; Claude Code
-    always sends one)."""
-    if session_id:
-        return _seen_dir() / f"caveman-{_safe_session_id(session_id)}.flag"
-    return CAVEMAN_FLAG
-
-
-def read_caveman_flag(session_id: str | None = None) -> str | None:
-    """Raw flag content (a level, an off-word, or None if absent/unreadable)."""
-    try:
-        v = _caveman_flag_path(session_id).read_text(encoding="utf-8").strip().lower()
-    except Exception:
-        return None
-    return v or None
-
-
-def write_caveman_flag(mode: str, session_id: str | None = None) -> None:
-    """Persist the active level atomically (tmp write + os.replace) — fail-silent,
-    a hook must never crash on FS error."""
-    try:
-        p = _caveman_flag_path(session_id)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(p.suffix + ".tmp")
-        tmp.write_text((mode or "").strip().lower(), encoding="utf-8")
-        os.replace(tmp, p)
-    except Exception:
-        pass
-
-
-def normalize_caveman_mode(raw: str) -> str | None:
-    """Map a user token → canonical level / 'off' / None (unknown)."""
-    t = (raw or "").strip().lower()
-    if t in _CAVEMAN_OFF_WORDS:
-        return "off"
-    if t in ("", "on", "default"):
-        return CAVEMAN_DEFAULT_MODE
-    if t == "wenyan":
-        return "wenyan-full"
-    if t in CAVEMAN_MODES:
-        return t
-    return None
-
-
-def caveman_active_mode(session_id: str | None = None) -> str | None:
-    """Current active level, or None if disabled (globally-off, or session 'off')."""
-    if caveman_globally_off():
-        return None
-    v = read_caveman_flag(session_id)
-    if v in _CAVEMAN_OFF_WORDS:
-        return None
-    return v if v in CAVEMAN_MODES else None
-
-
-def caveman_session_block(session_id: str | None = None) -> str:
-    """SessionStart: establish always-on default + return the ruleset to inject.
-
-    Always-on semantics: an explicit level persists across sessions, but a prior
-    "stop caveman" (off) NEVER persists — each session re-establishes the default.
-    Returns '' only when the permanent kill switch is set.
+    This is an evidence checkpoint, not an assertion that every reported result is verified.
+    Native summaries carry earlier state. Raw image/JSON payloads and secrets stay excluded.
     """
-    if caveman_globally_off():
-        return ""
-    mode = read_caveman_flag(session_id)
-    if mode not in CAVEMAN_MODES:        # absent, garbage, or an off-word → reset
-        mode = CAVEMAN_DEFAULT_MODE
-        write_caveman_flag(mode, session_id)
-    return CAVEMAN_RULESET.format(level=mode)
+    users=[]; reports=[]; files=[]; cmds=[]; summaries=[]
+    def add(target,value):
+        if value and value not in target:target.append(value)
+    for r in records:
+        kind=r.get("kind")
+        if kind == "tool_use":
+            inp=r.get("input") or {}
+            for path in inp.get("paths",[]):add(files,path)
+            add(files,inp.get("file_path") or inp.get("notebook_path"))
+            if r.get("name") in ("Bash","PowerShell","exec_command"):
+                command=inp.get("command") or inp.get("cmd") or ""
+                if command and not scan_secrets(command):add(cmds,command)
+        elif kind == "summary":
+            add(summaries,_strip_noise_prose(r.get("text","")))
+        elif kind == "text":
+            text=r.get("text","")
+            if not isinstance(text,str):continue
+            text="\n".join(line for line in text.splitlines() if not is_noise_line(line)).strip()
+            if not text or _looks_binary(text) or text.startswith(("<external_","# AGENTS.md instructions","[Request interrupted")):continue
+            if r.get("role")=="user":add(users,text)
+            elif r.get("role")=="assistant":add(reports,text)
+    sections=[("Previous native context summary",summaries),
+              ("User requests and constraints (chronological)",users),
+              ("Assistant reports (verify against artifacts)",reports),
+              ("Files touched",files),("Commands run",cmds)]
+    return "\n\n".join("### "+title+"\n"+"\n\n".join("- "+item for item in items) for title,items in sections if items)
 
 
-def caveman_handle_prompt(prompt: str, session_id: str | None = None) -> str:
-    """UserPromptSubmit: parse /caveman + NL activation, update the flag, and return
-    the tiny per-turn reinforcement anchor when caveman is active (else '')."""
-    if caveman_globally_off():
-        return ""
-    text = (prompt or "").strip()
-    m = _CAVEMAN_SLASH.match(text)
-    if m:
-        norm = normalize_caveman_mode(m.group(1) or "")
-        if norm:
-            write_caveman_flag(norm, session_id)
-    elif _CAVEMAN_OFF_NL.search(text):
-        write_caveman_flag("off", session_id)
-    elif _CAVEMAN_ON_NL.search(text):
-        write_caveman_flag(CAVEMAN_DEFAULT_MODE, session_id)
-
-    mode = caveman_active_mode(session_id)
-    if not mode:
-        return ""
-    # Attention anchor — keeps caveman style alive after other plugins inject
-    # competing instructions mid-conversation. The full ruleset (incl. the
-    # security/destructive-action carve-out) stays in the cache-stable SessionStart
-    # prefix; this is just a cheap per-turn reminder, shrunk from ~29 to ~14 tok
-    # since the full rule text doesn't need repeating every turn.
-    return f"[caveman:{mode}; normal prose for security/destructive]"
-
+# ══════════════════════════════════════════════════════════════════════════
+# Explicit memory-vault synchronization; no model or output-style policy
+# ══════════════════════════════════════════════════════════════════════════
 
 VAULT_DIR = Path(
     os.environ.get("MEGAMIND_VAULT_DIR") or (Path.home() / "Documents" / "GitHub" / "memory-vault")

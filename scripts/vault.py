@@ -143,7 +143,15 @@ def sync(slug: str, force: bool = False) -> str:
     try:
         with _sync_lock():
             mirror_project_memory(slug)
-            git_quiet(["add", "-A"], VAULT_DIR, timeout=15)
+            scope = f'{slug}/memory/'
+            rc, staged = git_quiet(['diff', '--cached', '--name-only'], VAULT_DIR)
+            if rc != 0:
+                return 'ABORT: cannot inspect staged vault changes'
+            if any(not name.startswith(scope) for name in staged.splitlines()):
+                return 'ABORT: unrelated staged changes; leave user index untouched'
+            rc, _ = git_quiet(["add", "--", scope], VAULT_DIR, timeout=15)
+            if rc != 0:
+                return 'ABORT: project memory staging failed'
 
             rc, _ = git_quiet(["diff", "--cached", "--quiet"], VAULT_DIR, timeout=10)
             if rc == 0:
@@ -153,47 +161,23 @@ def sync(slug: str, force: bool = False) -> str:
             # Secret gate over the staged diff (git path bypasses the Bash pre-commit hook).
             _, diff = git_quiet(["diff", "--cached"], VAULT_DIR, timeout=10)
             if scan_secrets(diff):
-                git_quiet(["reset"], VAULT_DIR, timeout=10)
                 log_err("vault sync ABORTED: a secret-looking token was found in the staged diff.")
                 return "ABORT: secret detected in staged memory — not committed"
 
-            git_quiet(["commit", "-m", f"[megamind] auto-sync {slug} {now_iso()}"], VAULT_DIR, timeout=10)
+            crc, _ = git_quiet(["commit", "-m", f"[megamind] auto-sync {slug} {now_iso()}"], VAULT_DIR, timeout=10)
+            if crc != 0:
+                return 'ABORT: commit failed; no push attempted'
             prc, pout = git_quiet(["push"], VAULT_DIR, timeout=20)
-            _touch_stamp()
+            if prc == 0:
+                _touch_stamp()
             return "synced + pushed" if prc == 0 else f"committed; push failed: {pout.strip()[:120]}"
     except TimeoutError:
         return "skip: another vault sync in progress (lock busy)"
 
 
 def prune() -> str:
-    """Remove transcript-noise dumps from the vault index + disk AND local projects."""
-    pat = re.compile(r"compact-(auto|manual)")
-    removed = 0
-    # Vault working tree (under the same lock as sync — both touch the git index)
-    if VAULT_DIR.exists():
-        try:
-            with _sync_lock():
-                for md in VAULT_DIR.rglob("*.md"):
-                    if md.name.startswith("_compact-") or pat.search(md.name):
-                        git_quiet(["rm", "--cached", "--ignore-unmatch", str(md)], VAULT_DIR, timeout=10)
-                        try:
-                            md.unlink()
-                            removed += 1
-                        except Exception:
-                            pass
-                git_quiet(["commit", "-m", "[megamind] prune transcript noise"], VAULT_DIR, timeout=10)
-        except TimeoutError:
-            log_err("vault prune skipped: sync lock busy")
-    # Local project memory copies
-    if PROJECTS_ROOT.exists():
-        for md in PROJECTS_ROOT.rglob("*.md"):
-            if md.name.startswith("_compact-") or pat.search(md.name):
-                try:
-                    md.unlink()
-                    removed += 1
-                except Exception:
-                    pass
-    return f"pruned {removed} noise file(s)"
+    """Preserve historical records; no automatic destructive maintenance."""
+    return 'disabled: historical memory is preserved; no files or index entries deleted'
 
 
 def main(argv: list[str]) -> int:
