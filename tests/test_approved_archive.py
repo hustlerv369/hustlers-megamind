@@ -8,7 +8,7 @@ def test_archived_approved_global_update_reaches_another_client(tmp_path, monkey
     project.mkdir()
     (project / '.git').mkdir()
     vault = tmp_path / 'vault'
-    archive = vault / '_approved-native-updates'
+    archive = vault / '_approved-native-updates' / 'memory'
     archive.mkdir(parents=True)
     note = archive / 'decision.md'
     note.write_text('---\nscope: global\ntype: feedback\n---\nDo not restore the rejected mechanism.', encoding='utf-8')
@@ -23,7 +23,7 @@ def test_exact_archived_copy_deduplicated_but_scopes_and_conflicts_preserved(tmp
     native = tmp_path / 'native'
     native.mkdir()
     vault = tmp_path / 'vault'
-    archive = vault / '_approved-native-updates'
+    archive = vault / '_approved-native-updates' / 'memory'
     archive.mkdir(parents=True)
     body = '---\nscope: global\n---\nCurrent quality correction.'
     (native / 'a.md').write_text(body, encoding='utf-8')

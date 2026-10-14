@@ -54,7 +54,7 @@ def approved_updates(cwd, memory=None):
     seen = set()
     # Approved native notes can be explicitly archived into the private Vault.
     # Reading this archive never performs ingestion, commits or remote sync.
-    for directory in (APPROVED_UPDATES, VAULT_DIR / '_approved-native-updates'):
+    for directory in (APPROVED_UPDATES, VAULT_DIR / '_approved-native-updates' / 'memory'):
         if not directory.is_dir():
             continue
         for path in directory.glob('*.md'):

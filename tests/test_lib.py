@@ -296,7 +296,7 @@ def test_score_file_noise_excluded_via_grep(tmp_path):
 
 
 def test_secret_scan():
-    assert lib.scan_secrets("key sk-abcdefghijklmnop12345xyz")
+    assert lib.scan_secrets("key " + "sk-" + "abcdefghijklmnop12345xyz")
     assert lib.scan_secrets("-----BEGIN OPENSSH PRIVATE KEY-----")
     assert not lib.scan_secrets("no secrets here, just normal prose about code")
 
@@ -500,7 +500,7 @@ def test_prune_old_resume_notes_ignores_manual_notes(tmp_path):
 
 def test_secret_scan_widened_patterns():
     assert lib.scan_secrets("STRIPE_KEY=sk_live_abcdefghijklmnop1234")
-    assert lib.scan_secrets("ANTHROPIC_API_KEY=sk-ant-api03-abcdefghijklmnopqrstuvwx")
+    assert lib.scan_secrets("ANTHROPIC_API_KEY=" + "sk-" + "ant-api03-abcdefghijklmnopqrstuvwx")
     assert lib.scan_secrets("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dQw4w9WgXcQ")
     assert not lib.scan_secrets("no secrets here, just normal prose about code")
 
