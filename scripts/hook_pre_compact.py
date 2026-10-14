@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-PreCompact hook — fires when Claude Code is about to auto-compact the transcript.
+PreCompact hook — fires when Claude Code is about to compact the transcript.
 
-Writes a session-summary file to memory/sessions/auto-<stamp>.md so that
-nothing of value is lost when older context gets dropped. The file contains
-the last N KB of the transcript plus any extractable todo/decisions.
+ULTRA: instead of dumping the last 20KB of the RAW transcript (which carried
+base64 image blobs + tool_use/tool_result JSONL that later polluted recall and
+the SessionStart slot), this parses the transcript and writes a CLEAN, bounded,
+structured resume — recent intent, decisions, files touched, commands, open
+questions — with all binary/JSON noise stripped at write time.
 
-This hook does NOT inject anything back into context (saving tokens); it
-only writes to disk. The next SessionStart hook will pick it up naturally.
+Writes to disk only (0 tokens at write time). Writes NO file if there's nothing
+clean to save, so it never seeds a garbage note. Never crashes compaction.
 """
 from __future__ import annotations
 
@@ -15,9 +17,18 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from lib import bump_stat, find_memory_dir, log_err, now_iso, read_hook_input, write_session_summary
-
-TRANSCRIPT_TAIL_BYTES = 20000  # ~5k tokens — cheap to re-read next session
+from lib import (
+    build_resume,
+    clear_seen,
+    find_memory_dir,
+    iter_transcript_blocks,
+    log_err,
+    now_iso,
+    prune_old_resume_notes,
+    read_hook_input,
+    session_key,
+    write_session_summary,
+)
 
 
 def main() -> None:
@@ -26,46 +37,46 @@ def main() -> None:
     transcript_path = payload.get("transcript_path")
     trigger = payload.get("trigger") or "unknown"  # 'auto' | 'manual'
 
+    # Compaction throws away the context window, so everything the inject ledger
+    # marked as "already delivered" is gone. Clear it FIRST — before any early
+    # return below — otherwise memory stays permanently suppressed for the rest
+    # of the session and the model silently loses the project's facts.
+    clear_seen(session_key(payload))
+
     mem = find_memory_dir(cwd)
     if not mem:
         return
 
-    tail = ""
-    if transcript_path:
-        try:
-            p = Path(transcript_path)
-            if p.exists():
-                size = p.stat().st_size
-                with p.open("rb") as f:
-                    if size > TRANSCRIPT_TAIL_BYTES:
-                        f.seek(size - TRANSCRIPT_TAIL_BYTES)
-                    tail = f.read().decode("utf-8", errors="ignore")
-        except Exception as exc:
-            log_err(f"pre-compact: failed to read transcript: {exc}")
-
-    body_parts = [
-        f"# Pre-compact snapshot — {now_iso()}",
-        f"",
-        f"Trigger: `{trigger}`",
-        f"",
-        "Auto-saved right before Claude Code compacted older context. The tail of",
-        "the transcript is preserved below so facts and decisions discussed in",
-        "the first half of the session can still be recovered by future sessions.",
-        "",
-        "---",
-        "",
-        "## Transcript tail",
-        "",
-        "```",
-        tail or "(transcript unavailable)",
-        "```",
-    ]
-
     try:
-        write_session_summary(mem, f"compact-{trigger}", "\n".join(body_parts))
-        bump_stat(mem, "compact")
+        records = iter_transcript_blocks(transcript_path) if transcript_path else []
+        resume = build_resume(records)
+        if not resume:
+            # Nothing clean worth saving — write NO garbage file.
+            return
+        body = "\n".join(
+            [
+                f"# Resume snapshot — {now_iso()}",
+                "",
+                f"Trigger: `{trigger}`",
+                f"Session: {session_key(payload) or 'unknown'}",
+                f"Project: {cwd}",
+                f"Transcript source: {transcript_path or 'unavailable'}",
+                "",
+                "Clean structured resume written right before compaction. The raw transcript,",
+                "base64 blobs, and tool JSON were stripped at write time so future sessions",
+                "recall signal, not noise.",
+                "",
+                "---",
+                "",
+                resume,
+            ]
+        )
+        write_session_summary(mem, f"resume-{trigger}", body)
+        # Retain checkpoints; no automatic archiving from the searchable memory.
     except Exception as exc:
-        log_err(f"pre-compact: write failed: {exc}")
+        # Only truly unexpected failures get logged; the expected
+        # empty/absent-transcript path is silent to keep PreCompact at 0 tokens.
+        log_err(f"pre-compact: {exc}")
 
 
 if __name__ == "__main__":

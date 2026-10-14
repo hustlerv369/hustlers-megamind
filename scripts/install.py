@@ -56,7 +56,11 @@ def save_settings(data: dict) -> None:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         backup = SETTINGS.with_suffix(f".json.bak-{stamp}")
         shutil.copy2(SETTINGS, backup)
-    SETTINGS.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    # Atomic write (tmp + os.replace) — a crash mid-write can never leave
+    # settings.json (which gates every hook/permission/MCP server) truncated.
+    tmp = SETTINGS.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, SETTINGS)
 
 
 def build_hook_entry(script_path: Path) -> dict:
@@ -83,6 +87,15 @@ def strip_existing(entries: list, marker: str) -> list:
     return out
 
 
+def warn_contextmode_global() -> None:
+    """Surface conflicting context transport without recommending compression."""
+    settings = load_settings()
+    commands = [h.get('command', '') for entries in settings.get('hooks', {}).values()
+                for entry in entries or [] for h in entry.get('hooks', [])]
+    if any('context-mode' in name.lower() for name in settings.get('mcpServers', {})) or any('context-mode' in command.lower() for command in commands):
+        print('WARNING: context-mode is registered. Verify complete source delivery; automatic lossy context proxies are retired.')
+
+
 def install() -> None:
     settings = load_settings()
     hooks = settings.setdefault("hooks", {})
@@ -102,6 +115,7 @@ def install() -> None:
     save_settings(settings)
     print(f"\nInstalled. Backup of previous settings saved alongside {SETTINGS}.")
     print("Restart Claude Code (or open a new session) for hooks to take effect.")
+    warn_contextmode_global()
 
 
 def uninstall() -> None:
