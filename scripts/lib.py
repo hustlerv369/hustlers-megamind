@@ -779,3 +779,144 @@ def git_quiet(args: list[str], cwd: Path, timeout: int = 10) -> tuple[int, str]:
         return p.returncode, (p.stdout or "") + (p.stderr or "")
     except Exception as exc:
         return 1, str(exc)
+
+# Preserve the review branch independent manual CLI APIs. No automatic recall reduction.
+
+STATS_FILE = ".megamind-stats.json"
+TOKENS_SAVED_PER_SESSION_START = 1200
+TOKENS_SAVED_PER_PROMPT_HIT = 500
+TOKENS_SAVED_PER_COMPACT = 800
+TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
+def ensure_memory_dir(cwd: str | None) -> Path:
+    """
+    Ensure memory dir exists for this project — create MEMORY.md skeleton
+    if missing. Returns the memory dir path. Never raises for permission.
+    """
+    slug = project_slug_from_cwd(cwd)
+    if not slug:
+        raise ValueError("cannot derive project slug from cwd")
+    mem = PROJECTS_ROOT / slug / "memory"
+    mem.mkdir(parents=True, exist_ok=True)
+    idx = mem / "MEMORY.md"
+    if not idx.exists():
+        idx.write_text(
+            "# Project memory index\n\n"
+            "Newest entries first. One line per fact, tag with emoji.\n\n",
+            encoding="utf-8",
+        )
+    return mem
+
+def append_memory_line(mem_dir: Path, text: str, tag: str = "📦") -> str:
+    """
+    Append a one-line fact to MEMORY.md. Returns the line written.
+    Deduplicates: if the same text is already there, no-op.
+    """
+    if scan_secrets(text):
+        raise ValueError("Secret-looking memory text rejected")
+    idx = mem_dir / "MEMORY.md"
+    existing = idx.read_text(encoding="utf-8", errors="strict") if idx.exists() else ""
+    stamp = datetime.now().strftime("%Y-%m-%d")
+    line = f"- {tag} [{stamp}] {text.strip()}\n"
+    if line.strip() in existing:
+        return line
+    with idx.open("a", encoding="utf-8") as f:
+        f.write(line)
+    return line
+
+def forget_memory_line(mem_dir: Path, query: str) -> list[str]:
+    """
+    Remove lines from MEMORY.md matching query (case-insensitive).
+    Returns the removed lines (may be empty).
+    """
+    idx = mem_dir / "MEMORY.md"
+    if not idx.exists():
+        return []
+    lines = idx.read_text(encoding="utf-8", errors="strict").splitlines(keepends=True)
+    q = query.lower().strip()
+    if not q:
+        return []
+    kept: list[str] = []
+    removed: list[str] = []
+    for line in lines:
+        if line.strip().startswith("-") and q in line.lower():
+            removed.append(line)
+        else:
+            kept.append(line)
+    if removed:
+        idx.write_text("".join(kept), encoding="utf-8")
+    return removed
+
+def stats_file(mem_dir: Path) -> Path:
+    return mem_dir / STATS_FILE
+
+def load_stats(mem_dir: Path) -> dict:
+    f = stats_file(mem_dir)
+    if not f.exists():
+        return {}
+    try:
+        return json.loads(f.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def bump_stat(mem_dir: Path, key: str, delta: int = 1) -> None:
+    """Increment a counter. Silent on any error (stats are non-critical)."""
+    try:
+        data = load_stats(mem_dir)
+        data[key] = data.get(key, 0) + delta
+        data["last_updated"] = now_iso()
+        stats_file(mem_dir).write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+def estimate_tokens_saved(stats: dict) -> int:
+    # Historical compatibility heuristic only; not measured savings or a routing signal.
+    s = stats.get("session_start", 0) * TOKENS_SAVED_PER_SESSION_START
+    s += stats.get("prompt_hit", 0) * TOKENS_SAVED_PER_PROMPT_HIT
+    s += stats.get("compact", 0) * TOKENS_SAVED_PER_COMPACT
+    return s
+
+def list_templates() -> list[str]:
+    if not TEMPLATES_DIR.exists():
+        return []
+    return sorted(p.name for p in TEMPLATES_DIR.iterdir() if p.is_dir())
+
+def copy_template(name: str, mem_dir: Path) -> int:
+    """
+    Copy all files from templates/<name>/ into mem_dir. Does not overwrite
+    existing files. Returns number of files created.
+    """
+    src = (TEMPLATES_DIR / name).resolve()
+    if not src.is_relative_to(TEMPLATES_DIR.resolve()):
+        raise FileNotFoundError("Template must stay inside the template directory")
+    if not src.exists() or not src.is_dir():
+        raise FileNotFoundError(f"no such template: {name}")
+    created = 0
+    for entry in src.rglob("*"):
+        if entry.is_dir():
+            continue
+        rel = entry.relative_to(src)
+        dst = mem_dir / rel
+        if not dst.resolve().is_relative_to(mem_dir.resolve()):
+            raise ValueError("Template destination escaped memory directory")
+        if dst.exists():
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(entry.read_bytes())
+        created += 1
+    return created
+_scan_secret_text = scan_secrets
+
+def scan_secrets(value):
+    """Keep text safety checks and the review branch's read-only directory audit."""
+    if not isinstance(value, Path):
+        return _scan_secret_text(value)
+    patterns = [('stripe-live', re.compile(r'sk' + r'_live_[A-Za-z0-9]{16,}')),
+                ('anthropic', re.compile(r'sk' + r'-ant-[A-Za-z0-9_-]{16,}')),
+                ('openai', re.compile(r'sk' + r'-(?!ant-)[A-Za-z0-9_-]{16,}'))]
+    hits = []
+    for path in value.rglob('*.md'):
+        for number, line in enumerate(path.read_text(encoding='utf-8').splitlines(), 1):
+            for name, pattern in patterns:
+                if pattern.search(line):
+                    hits.append((path, name, number, '[redacted]'))
+    return hits

@@ -150,3 +150,19 @@ def test_copy_template_unknown_raises(tmp_path, monkeypatch):
     except FileNotFoundError:
         return
     assert False, "expected FileNotFoundError"
+
+
+def test_manual_note_rejects_secret_before_writing(tmp_path, monkeypatch):
+    import pytest
+    cwd = _setup_fake_home(tmp_path, monkeypatch)
+    mem = lib.ensure_memory_dir(cwd)
+    original = (mem / 'MEMORY.md').read_bytes()
+    with pytest.raises(ValueError):
+        lib.append_memory_line(mem, OPENAI_FIXTURE)
+    assert (mem / 'MEMORY.md').read_bytes() == original
+
+
+def test_template_path_cannot_escape_bundled_sources(tmp_path):
+    import pytest
+    with pytest.raises(FileNotFoundError):
+        lib.copy_template('../../', tmp_path)

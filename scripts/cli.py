@@ -182,7 +182,7 @@ def cmd_reconcile() -> int:
 
 
 
-def main(argv: list[str]) -> int:
+def _context_main(argv: list[str]) -> int:
     if len(argv) < 2:
         print(__doc__.strip())
         return 1
@@ -204,6 +204,114 @@ def main(argv: list[str]) -> int:
     print(__doc__.strip())
     return 1
 
+
+
+from lib import append_memory_line, copy_template, ensure_memory_dir, forget_memory_line, list_templates, load_stats, scan_secrets
+import argparse
+
+def cmd_remember(args) -> int:
+    text = " ".join(args.text).strip()
+    if not text:
+        print("remember: missing text", file=sys.stderr)
+        return 2
+    cwd = os.getcwd()
+    try:
+        mem = ensure_memory_dir(cwd)
+    except ValueError as e:
+        print(f"remember: {e}", file=sys.stderr)
+        return 1
+    line = append_memory_line(mem, text, tag=args.tag)
+    print(f"✅  remembered: {line.strip()}")
+    return 0
+
+def cmd_forget(args) -> int:
+    keyword = " ".join(args.keyword).strip()
+    if not keyword:
+        print("forget: missing keyword", file=sys.stderr)
+        return 2
+    cwd = os.getcwd()
+    mem = find_memory_dir(cwd)
+    if not mem:
+        print(f"No memory dir for {cwd}", file=sys.stderr)
+        return 1
+    removed = forget_memory_line(mem, keyword)
+    if not removed:
+        print(f"(no MEMORY.md lines matched '{keyword}')")
+        return 0
+    print(f"🗑️   forgot {len(removed)} line(s):")
+    for line in removed:
+        print(f"    {line.strip()}")
+    return 0
+
+def cmd_audit(args) -> int:
+    cwd = os.getcwd()
+    mem = find_memory_dir(cwd)
+    if not mem:
+        print(f"No memory dir for {cwd}", file=sys.stderr)
+        return 1
+    hits = scan_secrets(mem)
+    if not hits:
+        print("🟢  audit clean — no secret-looking patterns in memory")
+        return 0
+    print(f"🔴  audit — {len(hits)} potential secret pattern(s) found:\n")
+    for path, pattern, line_no, snippet in hits:
+        rel = path.relative_to(mem)
+        print(f"  {rel}:{line_no}  [{pattern}]  {snippet}")
+    print("\nReview each match. Remove from the file if it's a real secret,")
+    print("then rotate the credential. Audit only flags patterns — verify context.")
+    return 1
+
+def cmd_init(args) -> int:
+    cwd = os.getcwd()
+    try:
+        mem = ensure_memory_dir(cwd)
+    except ValueError as e:
+        print(f"init: {e}", file=sys.stderr)
+        return 1
+    print(f"✅  memory dir ready: {mem}")
+    if args.template:
+        try:
+            n = copy_template(args.template, mem)
+        except FileNotFoundError as e:
+            print(f"init: {e}", file=sys.stderr)
+            print(f"Available templates: {', '.join(list_templates()) or '(none)'}", file=sys.stderr)
+            return 1
+        print(f"✅  seeded {n} file(s) from template '{args.template}'")
+    print("\nNext: fill in memory files, then verify actual hook retrieval and full-source delivery.")
+    return 0
+
+def cmd_templates(args) -> int:
+    names = list_templates()
+    if not names:
+        print("(no templates bundled)")
+        return 0
+    print("Available templates:")
+    for name in names:
+        print(f"  • {name}")
+    return 0
+
+def main(argv):
+    if len(argv) < 2 or argv[1] not in ('remember', 'forget', 'audit', 'init', 'templates', 'stats'):
+        return _context_main(argv)
+    command = argv[1]
+    parser = argparse.ArgumentParser(prog='megamind ' + command)
+    if command == 'remember':
+        parser.add_argument('text', nargs='+')
+        parser.add_argument('--tag', default='📦')
+    elif command == 'forget':
+        parser.add_argument('keyword', nargs='+')
+    elif command == 'init':
+        parser.add_argument('--template')
+    args = parser.parse_args(argv[2:])
+    if command == 'stats':
+        memory = find_memory_dir(os.getcwd())
+        if memory is None:
+            print('No verified project memory.', file=sys.stderr)
+            return 1
+        print(load_stats(memory))
+        print('Historical counters are not proof of context delivery. Savings estimates are retired.')
+        return 0
+    return globals()['cmd_' + command](args)
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv))
