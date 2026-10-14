@@ -1,5 +1,6 @@
 """Memory Vault integration and no-loss regressions; isolated fixtures only."""
 from pathlib import Path
+NATIVE=Path(__file__).resolve().parents[1]/'codex'
 from unittest.mock import patch
 import json
 import importlib.util
@@ -87,7 +88,7 @@ def test_all_assistant_reports_survive_checkpoint():
 
 
 def test_codex_more_than_1500_records_and_large_prose_survive(tmp_path):
-    source=Path.home()/'.codex/hooks/megamind_pre_compact.py'
+    source=NATIVE/'megamind_pre_compact.py'
     spec=importlib.util.spec_from_file_location('vault_codex',source)
     adapter=importlib.util.module_from_spec(spec);spec.loader.exec_module(adapter)
     path=tmp_path/'messages.jsonl'
@@ -100,7 +101,7 @@ def test_codex_more_than_1500_records_and_large_prose_survive(tmp_path):
 
 
 def test_repeated_statement_after_changed_context_is_not_deleted(tmp_path):
-    source=Path.home()/'.codex/hooks/megamind_pre_compact.py'
+    source=NATIVE/'megamind_pre_compact.py'
     spec=importlib.util.spec_from_file_location('vault_repeats',source)
     adapter=importlib.util.module_from_spec(spec);spec.loader.exec_module(adapter)
     path=tmp_path/'repeat.jsonl'

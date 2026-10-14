@@ -1,5 +1,6 @@
 """Regression contract for the user-authorized context-quality repair."""
 from pathlib import Path
+NATIVE=Path(__file__).resolve().parents[1]/'codex'
 from unittest.mock import patch
 import importlib.util, io, json, os, subprocess, sys
 
@@ -94,7 +95,7 @@ def test_removed_style_functions_cannot_reactivate():
     assert not hasattr(lib,'lean_on')
 
 def test_codex_adapter_preserves_tools_summaries_and_czech_result(tmp_path):
-    adapter=load('quality_cp_adapter',Path.home()/'.codex/hooks/megamind_pre_compact.py')
+    adapter=load('quality_cp_adapter',NATIVE/'megamind_pre_compact.py')
     records=[{'type':'response_item','payload':{'type':'message','role':'assistant','channel':'summary','content':[{'type':'output_text','text':'Earlier accepted constraint UNIQUE_SUMMARY'}]}},
              {'type':'response_item','payload':{'type':'function_call','name':'apply_patch','arguments':'*** Add File: D:/test/result.md\n+hello'}},
              {'type':'response_item','payload':{'type':'message','role':'assistant','channel':'final','content':[{'type':'output_text','text':'Ověřeno 12 testů, soubor uložen.'}]}}]
@@ -104,20 +105,20 @@ def test_codex_adapter_preserves_tools_summaries_and_czech_result(tmp_path):
 
 def test_broken_hook_failure_is_visible_without_secret_leak(tmp_path):
     broken=tmp_path/'broken.py';broken.write_text('raise RuntimeError("do not print this private value")',encoding='utf-8')
-    result=subprocess.run([sys.executable,str(Path.home()/'.codex/hooks/megamind_hook_adapter.py'),'SessionStart',str(broken)],input='{}',text=True,capture_output=True)
+    result=subprocess.run([sys.executable,str(NATIVE/'megamind_hook_adapter.py'),'SessionStart',str(broken)],input='{}',text=True,capture_output=True)
     data=json.loads(result.stdout)
     assert 'failed' in data['hookSpecificOutput']['additionalContext']
     assert result.stderr and 'private value' not in result.stderr+result.stdout
 
 def test_source_filters_still_exclude_image_and_credentials(tmp_path):
-    adapter=load('quality_filter',Path.home()/'.codex/hooks/megamind_pre_compact.py')
+    adapter=load('quality_filter',NATIVE/'megamind_pre_compact.py')
     text='normal context\npassword=super-private-fixture\ndata:image/png;base64,AAABBB'
     cleaned=adapter._clean_text(text)
     assert 'normal context' in cleaned and 'super-private' not in cleaned and 'data:image' not in cleaned
 
 
 def test_codex_custom_tools_preserve_source_paths(tmp_path):
-    adapter=load('quality_custom',Path.home()/'.codex/hooks/megamind_pre_compact.py')
+    adapter=load('quality_custom',NATIVE/'megamind_pre_compact.py')
     p=tmp_path/'custom.jsonl'
     code='text(await tools.exec_command({cmd:"python helper.py",workdir:"D:/Project with spaces"}));'
     p.write_text(json.dumps({'type':'response_item','payload':{'type':'custom_tool_call','name':'functions.exec','input':code}}),encoding='utf-8')
